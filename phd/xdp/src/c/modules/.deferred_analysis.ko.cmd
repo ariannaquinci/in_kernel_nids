@@ -1,0 +1,1 @@
+savedcmd_/home/ari/phd/xdp/src/c/modules/deferred_analysis.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/ari/phd/xdp/src/c/modules/deferred_analysis.ko /home/ari/phd/xdp/src/c/modules/deferred_analysis.o /home/ari/phd/xdp/src/c/modules/deferred_analysis.mod.o
