@@ -1,1 +1,0 @@
-savedcmd_/home/ari/phd/in-kernel-nids/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/ari/phd/in-kernel-nids/Module.symvers -T /home/ari/phd/in-kernel-nids/modules.order -i Module.symvers -e 
