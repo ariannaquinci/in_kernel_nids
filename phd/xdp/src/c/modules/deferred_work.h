@@ -15,7 +15,7 @@ bool dw_are_done(u32 pkt_id, u32 req_mask, u32 *done_out);
 
 /* verdict: 0=UNKNOWN, 1=PASS, 2=DROP */
 int  dw_get_verdict(u32 pkt_id);
-void dw_note_payload_signature(struct sk_buff *skb, u32 pkt_id, u32 req_mask);
+void dw_note_payload_signature(u32 pkt_id, u32 req_mask, bool is_malicious);
 
 /* bufferizzazione (copia skb + queue interna) */
 int  dw_buffer_marked_skb(struct sk_buff *skb, u32 pkt_id, u32 req_mask, u32 mark_dummy);

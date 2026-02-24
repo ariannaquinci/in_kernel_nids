@@ -23,6 +23,8 @@ enum {
 	DW_REQ_MASK_3 = DW_REQ_A1 | DW_REQ_A2 | DW_REQ_A3,
 };
 
+#define DW_XDP_SNAPSHOT_MAX 4096u
+
 enum {
 	DW_VERDICT_UNKNOWN = 0,
 	DW_VERDICT_PASS    = 1,

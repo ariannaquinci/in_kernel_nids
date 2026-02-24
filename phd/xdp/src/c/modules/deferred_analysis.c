@@ -12,6 +12,7 @@
 #include <linux/spinlock.h>
 #include <linux/jiffies.h>
 #include <linux/udp.h>
+#include <linux/if_ether.h>
 
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
@@ -72,11 +73,46 @@ struct meta_ent {
 static DEFINE_HASHTABLE(meta_ht, META_BITS);
 static DEFINE_SPINLOCK(meta_lock);
 
-/* -------- buffering queue -------- */
+/* -------- XDP packet snapshots: pkt_id -> frame copy -------- */
+
+struct pkt_snap_ent {
+	u32 pkt_id;
+	u32 frame_len;
+	u32 cap_len;
+	unsigned long ts_jiffies;
+	struct hlist_node hnode;
+	u8 data[];
+};
+
+#define SNAP_BITS 12
+static DEFINE_HASHTABLE(snap_ht, SNAP_BITS);
+static DEFINE_SPINLOCK(snap_lock);
+
+/* -------- per-flow buffering (FIFO per preservare ordine del flow) -------- */
+
+struct dw_flow_key {
+	u32 saddr;
+	u32 daddr;
+	u16 sport;
+	u16 dport;
+	u8  proto;
+	u8  pad1;
+	u16 pad2;
+} __aligned(4);
+
+struct flow_ent {
+	struct dw_flow_key key;
+	struct sk_buff_head q;
+	unsigned long last_seen_jiffies;
+	struct hlist_node hnode;
+};
+
+#define FLOW_BITS 12
+static DEFINE_HASHTABLE(flow_ht, FLOW_BITS);
+static DEFINE_SPINLOCK(flow_lock);
 
 static struct workqueue_struct *dw_wq;
 static struct work_struct deliver_work;
-static struct sk_buff_head bufq;
 
 /* -------- stats/debug -------- */
 
@@ -88,6 +124,11 @@ static atomic_t rr_cpu       = ATOMIC_INIT(0);
 #define DW_DUMMY_NEEDLE "malicious"
 
 /* -------- helpers -------- */
+
+struct dw_vlan_hdr {
+	__be16 tci;
+	__be16 enc_proto;
+} __packed;
 
 static struct pkt_state *state_lookup(u32 pkt_id)
 {
@@ -140,49 +181,113 @@ static bool buf_contains_needle(const u8 *buf, size_t len, const char *needle)
 	return false;
 }
 
-static bool skb_udp_payload_contains(struct sk_buff *skb, const char *needle)
+static struct pkt_snap_ent *snap_lookup_locked(u32 pkt_id)
 {
-	struct iphdr _iph, *iph;
-	struct udphdr _uh, *uh;
-	unsigned int l4_off, payload_off, skb_payload_len;
-	u16 udp_len;
-	u8 *buf;
-	bool found = false;
+	struct pkt_snap_ent *e;
 
-	if (!skb || !needle)
+	hash_for_each_possible(snap_ht, e, hnode, pkt_id) {
+		if (e->pkt_id == pkt_id)
+			return e;
+	}
+	return NULL;
+}
+
+static void snap_drop(u32 pkt_id)
+{
+	struct pkt_snap_ent *e;
+
+	spin_lock_bh(&snap_lock);
+	e = snap_lookup_locked(pkt_id);
+	if (e)
+		hash_del(&e->hnode);
+	spin_unlock_bh(&snap_lock);
+
+	kfree(e);
+}
+
+static bool frame_udp_payload_contains(const u8 *frame, u32 frame_len, const char *needle)
+{
+	const struct ethhdr *eth;
+	const struct iphdr *iph;
+	const struct udphdr *uh;
+	const u8 *nh;
+	u32 nh_len, l4_off, payload_off, payload_len;
+	__be16 h_proto;
+	int i;
+
+	if (!frame || !needle || frame_len < sizeof(*eth))
 		return false;
 
-	iph = skb_header_pointer(skb, 0, sizeof(_iph), &_iph);
-	if (!iph || iph->version != 4 || iph->protocol != IPPROTO_UDP)
+	eth = (const struct ethhdr *)frame;
+	nh = frame + sizeof(*eth);
+	nh_len = frame_len - sizeof(*eth);
+	h_proto = eth->h_proto;
+
+	for (i = 0; i < 2; i++) {
+		const struct dw_vlan_hdr *vh;
+
+		if (h_proto != htons(ETH_P_8021Q) &&
+		    h_proto != htons(ETH_P_8021AD))
+			break;
+
+		if (nh_len < sizeof(*vh))
+			return false;
+
+		vh = (const struct dw_vlan_hdr *)nh;
+		h_proto = vh->enc_proto;
+		nh += sizeof(*vh);
+		nh_len -= sizeof(*vh);
+	}
+
+	if (h_proto != htons(ETH_P_IP) || nh_len < sizeof(*iph))
+		return false;
+
+	iph = (const struct iphdr *)nh;
+	if (iph->version != 4 || iph->protocol != IPPROTO_UDP)
 		return false;
 
 	l4_off = iph->ihl * 4;
-	uh = skb_header_pointer(skb, l4_off, sizeof(_uh), &_uh);
-	if (!uh)
+	if (l4_off < sizeof(*iph) || nh_len < l4_off + sizeof(*uh))
 		return false;
 
-	udp_len = ntohs(uh->len);
-	if (udp_len <= sizeof(*uh))
+	uh = (const struct udphdr *)(nh + l4_off);
+	if (ntohs(uh->len) <= sizeof(*uh))
 		return false;
 
-	payload_off = l4_off + sizeof(*uh);
-	skb_payload_len = skb->len > payload_off ? (skb->len - payload_off) : 0;
-	if (!skb_payload_len)
+	payload_off = (u32)((const u8 *)(uh + 1) - frame);
+	if (payload_off > frame_len)
 		return false;
 
-	skb_payload_len = min_t(unsigned int, skb_payload_len, udp_len - sizeof(*uh));
-	if (!skb_payload_len)
+	payload_len = frame_len - payload_off;
+	payload_len = min_t(u32, payload_len, ntohs(uh->len) - sizeof(*uh));
+	if (!payload_len)
 		return false;
 
-	buf = kmalloc(skb_payload_len, GFP_ATOMIC);
-	if (!buf)
-		return false;
+	return buf_contains_needle(frame + payload_off, payload_len, needle);
+}
 
-	if (!skb_copy_bits(skb, payload_off, buf, skb_payload_len))
-		found = buf_contains_needle(buf, skb_payload_len, needle);
+static int snapshot_pkt_payload_contains(u32 pkt_id, const char *needle, bool *found_out)
+{
+	struct pkt_snap_ent *e;
+	bool found;
 
-	kfree(buf);
-	return found;
+	if (!found_out)
+		return -EINVAL;
+
+	spin_lock_bh(&snap_lock);
+	e = snap_lookup_locked(pkt_id);
+	if (e)
+		hash_del(&e->hnode);
+	spin_unlock_bh(&snap_lock);
+
+	if (!e)
+		return -ENOENT;
+
+	found = frame_udp_payload_contains(e->data, e->cap_len, needle);
+	kfree(e);
+
+	*found_out = found;
+	return 0;
 }
 
 u32 dw_get_done_mask(u32 pkt_id)
@@ -215,18 +320,13 @@ int dw_get_verdict(u32 pkt_id)
 }
 EXPORT_SYMBOL_GPL(dw_get_verdict);
 
-void dw_note_payload_signature(struct sk_buff *skb, u32 pkt_id, u32 req_mask)
+void dw_note_payload_signature(u32 pkt_id, u32 req_mask, bool is_malicious)
 {
 	struct pkt_state *st;
 	u32 req, done, hits;
-	bool is_malicious;
 
 	req = req_mask & DW_REQ_MASK_3;
-	if (!pkt_id || !req || !skb)
-		return;
-
-	is_malicious = skb_udp_payload_contains(skb, DW_DUMMY_NEEDLE);
-	if (!is_malicious)
+	if (!pkt_id || !req || !is_malicious)
 		return;
 
 	spin_lock_bh(&state_lock);
@@ -263,6 +363,72 @@ static bool key_equal(const struct dw_pkt_key *a, const struct dw_pkt_key *b)
 	return !memcmp(a, b, sizeof(*a));
 }
 
+static bool flow_key_equal(const struct dw_flow_key *a, const struct dw_flow_key *b)
+{
+	return !memcmp(a, b, sizeof(*a));
+}
+
+static bool skb_build_flow_key_ipv4_udp(struct sk_buff *skb, struct dw_flow_key *key)
+{
+	struct iphdr _iph, *iph;
+	struct udphdr _uh, *uh;
+	unsigned int l4_off;
+
+	if (!skb || !key)
+		return false;
+
+	iph = skb_header_pointer(skb, 0, sizeof(_iph), &_iph);
+	if (!iph || iph->version != 4 || iph->protocol != IPPROTO_UDP)
+		return false;
+
+	l4_off = iph->ihl * 4;
+	uh = skb_header_pointer(skb, l4_off, sizeof(_uh), &_uh);
+	if (!uh)
+		return false;
+
+	memset(key, 0, sizeof(*key));
+	key->saddr = iph->saddr;
+	key->daddr = iph->daddr;
+	key->sport = uh->source;
+	key->dport = uh->dest;
+	key->proto = iph->protocol;
+
+	return true;
+}
+
+static struct flow_ent *flow_lookup_locked(const struct dw_flow_key *key, u32 h)
+{
+	struct flow_ent *fe;
+
+	hash_for_each_possible(flow_ht, fe, hnode, h) {
+		if (flow_key_equal(&fe->key, key))
+			return fe;
+	}
+	return NULL;
+}
+
+static struct flow_ent *flow_get_or_create_locked(const struct dw_flow_key *key, u32 h)
+{
+	struct flow_ent *fe;
+
+	fe = flow_lookup_locked(key, h);
+	if (fe) {
+		fe->last_seen_jiffies = jiffies;
+		return fe;
+	}
+
+	fe = kzalloc(sizeof(*fe), GFP_ATOMIC);
+	if (!fe)
+		return NULL;
+
+	memcpy(&fe->key, key, sizeof(*key));
+	skb_queue_head_init(&fe->q);
+	fe->last_seen_jiffies = jiffies;
+	hash_add(flow_ht, &fe->hnode, h);
+
+	return fe;
+}
+
 /* kfunc: correlation put (XDP writes) */
 static __bpf_kfunc int dw_meta_put(struct dw_pkt_key *key, u32 pkt_id, u32 req_mask)
 {
@@ -288,6 +454,42 @@ static __bpf_kfunc int dw_meta_put(struct dw_pkt_key *key, u32 pkt_id, u32 req_m
 	spin_unlock_bh(&meta_lock);
 
 	return 0;
+}
+
+static __bpf_kfunc int dw_pkt_snapshot_put(const u8 *data, u32 len, u32 pkt_id)
+{
+	struct pkt_snap_ent *e, *old;
+	u32 cap_len;
+
+	if (!data || !len || !pkt_id)
+		return -EINVAL;
+
+	cap_len = min_t(u32, len, (u32)DW_XDP_SNAPSHOT_MAX);
+	e = kmalloc(struct_size(e, data, cap_len), GFP_ATOMIC);
+	if (!e)
+		return -ENOMEM;
+
+	e->pkt_id = pkt_id;
+	e->frame_len = len;
+	e->cap_len = cap_len;
+	e->ts_jiffies = jiffies;
+	memcpy(e->data, data, cap_len);
+
+	old = NULL;
+	spin_lock_bh(&snap_lock);
+	old = snap_lookup_locked(pkt_id);
+	if (old)
+		hash_del(&old->hnode);
+	hash_add(snap_ht, &e->hnode, pkt_id);
+	spin_unlock_bh(&snap_lock);
+
+	kfree(old);
+
+	if (len > cap_len)
+		pr_info("snapshot pkt_id=%u truncated frame_len=%u cap_len=%u\n",
+			pkt_id, len, cap_len);
+
+	return (int)cap_len;
 }
 
 /* exported API: NF consumes */
@@ -331,8 +533,11 @@ static void analysis_workfn(struct work_struct *w)
 	struct pkt_state *st;
 	u32 req_mask, done, hits;
 	bool is_malicious = false;
+	int sig_rc;
 
-	/* 3 analisi dummy: no false positive da pkt_id, il DROP vero arriva dal marker nel payload */
+	/* Signature check reads the XDP snapshot copied at schedule time. */
+	
+	/* 3 analisi dummy: no false positive da pkt_id beyond the payload marker check above */
 	switch (aw->bit) {
 	case DW_REQ_A1:
 		is_malicious = false;
@@ -341,8 +546,13 @@ static void analysis_workfn(struct work_struct *w)
 		is_malicious = false;
 		break;
 	case DW_REQ_A3:
-		fsleep(2);
-		is_malicious = false;
+		sig_rc = snapshot_pkt_payload_contains(aw->pkt_id, DW_DUMMY_NEEDLE,
+						       &is_malicious);
+		if (sig_rc < 0)
+			pr_info("analysis pkt_id=%u bit=0x%x snapshot not available rc=%d, continuing\n",
+				aw->pkt_id, aw->bit, sig_rc);
+		if (!sig_rc)
+			dw_note_payload_signature(aw->pkt_id, aw->bit, is_malicious);
 		break;
 	default:
 		break;
@@ -429,6 +639,7 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 BTF_SET8_START(dw_kfunc_set)
 BTF_ID_FLAGS(func, dw_register_and_schedule, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, dw_meta_put,              KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, dw_pkt_snapshot_put,      0)
 BTF_SET8_END(dw_kfunc_set)
 
 static const struct btf_kfunc_id_set dw_kfunc_ids = {
@@ -447,11 +658,20 @@ EXPORT_SYMBOL_GPL(dw_is_bypass_skb);
 int dw_buffer_marked_skb(struct sk_buff *skb, u32 pkt_id, u32 req_mask, u32 mark_dummy)
 {
 	struct sk_buff *nskb;
+	struct dw_flow_key fkey;
+	u32 h;
+	struct flow_ent *fe;
 
 	nskb = skb_copy(skb, GFP_ATOMIC);
 	if (!nskb) {
 		atomic_inc(&st_dropped);
 		return -ENOMEM;
+	}
+
+	if (!skb_build_flow_key_ipv4_udp(nskb, &fkey)) {
+		kfree_skb(nskb);
+		atomic_inc(&st_dropped);
+		return -EINVAL;
 	}
 
 	memset(nskb->cb, 0, sizeof(nskb->cb));
@@ -462,7 +682,19 @@ int dw_buffer_marked_skb(struct sk_buff *skb, u32 pkt_id, u32 req_mask, u32 mark
 
 	nskb->mark = mark_dummy;
 
-	__skb_queue_tail(&bufq, nskb);
+	h = jhash(&fkey, sizeof(fkey), 0);
+	spin_lock_bh(&flow_lock);
+	fe = flow_get_or_create_locked(&fkey, h);
+	if (!fe) {
+		spin_unlock_bh(&flow_lock);
+		kfree_skb(nskb);
+		atomic_inc(&st_dropped);
+		return -ENOMEM;
+	}
+	skb_queue_tail(&fe->q, nskb);
+	fe->last_seen_jiffies = jiffies;
+	spin_unlock_bh(&flow_lock);
+
 	atomic_inc(&st_pending);
 
 	queue_work(dw_wq, &deliver_work);
@@ -475,8 +707,10 @@ EXPORT_SYMBOL_GPL(dw_buffer_marked_skb);
 static void deliver_workfn(struct work_struct *w)
 {
 	struct net_device *lo;
+	struct flow_ent *fe;
+	struct hlist_node *tmp;
 	struct sk_buff *skb, *nskb;
-	unsigned int i, n;
+	int bkt;
 
 	lo = dev_get_by_name(&init_net, "lo");
 	if (!lo) {
@@ -484,62 +718,80 @@ static void deliver_workfn(struct work_struct *w)
 		return;
 	}
 
-	n = skb_queue_len(&bufq);
+	spin_lock_bh(&flow_lock);
+	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
+		for (;;) {
+			u32 pkt_id, req, done;
+			int verdict;
 
-	for (i = 0; i < n; i++) {
-		u32 pkt_id, req, done;
-		int verdict;
+			skb = skb_peek(&fe->q);
+			if (!skb)
+				break;
 
-		skb = skb_dequeue(&bufq);
-		if (!skb)
-			break;
+			pkt_id = dwcb(skb)->pkt_id;
+			req    = dwcb(skb)->req_mask;
+			verdict = dw_get_verdict(pkt_id);
 
-		pkt_id = dwcb(skb)->pkt_id;
-		req    = dwcb(skb)->req_mask;
-		verdict = dw_get_verdict(pkt_id);
+			if (verdict == DW_VERDICT_DROP) {
+				skb = skb_dequeue(&fe->q);
+				pr_info("deliver flow-head pkt_id=%u req=0x%x verdict=DROP -> free buffered skb\n",
+					pkt_id, req);
+				spin_unlock_bh(&flow_lock);
+				snap_drop(pkt_id);
+				kfree_skb(skb);
+				atomic_dec(&st_pending);
+				atomic_inc(&st_dropped);
+				spin_lock_bh(&flow_lock);
+				fe->last_seen_jiffies = jiffies;
+				continue;
+			}
 
-		if (verdict == DW_VERDICT_DROP) {
-			pr_info("deliver pkt_id=%u req=0x%x verdict=DROP -> free buffered skb\n",
-				pkt_id, req);
-			kfree_skb(skb);
-			atomic_dec(&st_pending);
-			atomic_inc(&st_dropped);
-			continue;
-		}
+			if (!dw_are_done(pkt_id, req, &done)) {
+				pr_info("deliver flow-head pkt_id=%u req=0x%x done=0x%x -> block flow head\n",
+					pkt_id, req, done);
+				break;
+			}
 
-		if (!dw_are_done(pkt_id, req, &done)) {
-			pr_info("deliver pkt_id=%u req=0x%x done=0x%x -> keep buffered\n",
+			skb = skb_dequeue(&fe->q);
+			pr_info("deliver flow-head pkt_id=%u req=0x%x done=0x%x verdict=PASS -> reinject\n",
 				pkt_id, req, done);
-			__skb_queue_tail(&bufq, skb);
-			continue;
-		}
+			spin_unlock_bh(&flow_lock);
+			snap_drop(pkt_id);
 
-		/* PASS: reinject */
-		pr_info("deliver pkt_id=%u req=0x%x done=0x%x verdict=PASS -> reinject\n",
-			pkt_id, req, done);
-		nskb = skb_copy(skb, GFP_KERNEL);
-		if (!nskb) {
+			nskb = skb_copy(skb, GFP_KERNEL);
+			if (!nskb) {
+				kfree_skb(skb);
+				atomic_dec(&st_pending);
+				atomic_inc(&st_dropped);
+				spin_lock_bh(&flow_lock);
+				continue;
+			}
+
+			memset(nskb->cb, 0, sizeof(nskb->cb));
+			nskb->mark = DW_BYPASS_MARK;
+			nskb->dev = lo;
+			nskb->protocol = htons(ETH_P_IP);
+			nskb->pkt_type = PACKET_HOST;
+			nskb->ip_summed = CHECKSUM_NONE;
+
+			if (netif_receive_skb(nskb) == NET_RX_SUCCESS)
+				atomic_inc(&st_delivered);
+			else
+				atomic_inc(&st_dropped);
+
 			kfree_skb(skb);
 			atomic_dec(&st_pending);
-			atomic_inc(&st_dropped);
-			continue;
+
+			spin_lock_bh(&flow_lock);
+			fe->last_seen_jiffies = jiffies;
 		}
 
-		memset(nskb->cb, 0, sizeof(nskb->cb));
-		nskb->mark = DW_BYPASS_MARK;
-		nskb->dev = lo;
-		nskb->protocol = htons(ETH_P_IP);
-		nskb->pkt_type = PACKET_HOST;
-		nskb->ip_summed = CHECKSUM_NONE;
-
-		if (netif_receive_skb(nskb) == NET_RX_SUCCESS)
-			atomic_inc(&st_delivered);
-		else
-			atomic_inc(&st_dropped);
-
-		kfree_skb(skb);
-		atomic_dec(&st_pending);
+		if (!skb_peek(&fe->q)) {
+			hash_del(&fe->hnode);
+			kfree(fe);
+		}
 	}
+	spin_unlock_bh(&flow_lock);
 
 	dev_put(lo);
 }
@@ -552,7 +804,8 @@ static int __init deferred_init(void)
 
 	hash_init(state_ht);
 	hash_init(meta_ht);
-	skb_queue_head_init(&bufq);
+	hash_init(flow_ht);
+	hash_init(snap_ht);
 
 	dw_wq = alloc_workqueue("dw_wq", WQ_UNBOUND | WQ_HIGHPRI, 0);
 	if (!dw_wq)
@@ -575,6 +828,8 @@ static void __exit deferred_exit(void)
 {
 	struct pkt_state *st;
 	struct meta_ent *me;
+	struct flow_ent *fe;
+	struct pkt_snap_ent *se;
 	struct sk_buff *skb;
 	struct hlist_node *tmp;
 	int bkt;
@@ -598,9 +853,23 @@ static void __exit deferred_exit(void)
 	}
 	spin_unlock_bh(&meta_lock);
 
-	/* cleanup bufq */
-	while ((skb = skb_dequeue(&bufq)) != NULL)
-		kfree_skb(skb);
+	/* cleanup flow_ht (per-flow buffered skbs) */
+	spin_lock_bh(&flow_lock);
+	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
+		hash_del(&fe->hnode);
+		while ((skb = skb_dequeue(&fe->q)) != NULL)
+			kfree_skb(skb);
+		kfree(fe);
+	}
+	spin_unlock_bh(&flow_lock);
+
+	/* cleanup snap_ht (XDP frame snapshots) */
+	spin_lock_bh(&snap_lock);
+	hash_for_each_safe(snap_ht, bkt, tmp, se, hnode) {
+		hash_del(&se->hnode);
+		kfree(se);
+	}
+	spin_unlock_bh(&snap_lock);
 
 	pr_info("unloaded\n");
 }
