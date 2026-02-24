@@ -1,1 +1,0 @@
-savedcmd_/home/ari/phd/in-kernel-nids/defer_packet_inspection.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/ari/phd/in-kernel-nids/defer_packet_inspection.ko /home/ari/phd/in-kernel-nids/defer_packet_inspection.o /home/ari/phd/in-kernel-nids/defer_packet_inspection.mod.o
