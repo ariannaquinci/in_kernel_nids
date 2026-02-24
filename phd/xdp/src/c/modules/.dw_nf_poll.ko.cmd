@@ -1,1 +1,0 @@
-savedcmd_/home/ari/phd/xdp/src/c/modules/dw_nf_poll.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/ari/phd/xdp/src/c/modules/dw_nf_poll.ko /home/ari/phd/xdp/src/c/modules/dw_nf_poll.o /home/ari/phd/xdp/src/c/modules/dw_nf_poll.mod.o

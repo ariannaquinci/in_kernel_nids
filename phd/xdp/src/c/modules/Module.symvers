@@ -1,5 +1,0 @@
-0xb4233bd9	dw_meta_get_and_del	/home/ari/phd/xdp/src/c/modules/deferred_analysis	EXPORT_SYMBOL_GPL	
-0xdaacd517	dw_is_bypass_skb	/home/ari/phd/xdp/src/c/modules/deferred_analysis	EXPORT_SYMBOL_GPL	
-0x0ded1547	dw_get_done_mask	/home/ari/phd/xdp/src/c/modules/deferred_analysis	EXPORT_SYMBOL_GPL	
-0xad3378a8	dw_are_done	/home/ari/phd/xdp/src/c/modules/deferred_analysis	EXPORT_SYMBOL_GPL	
-0x93b6026c	dw_buffer_marked_skb	/home/ari/phd/xdp/src/c/modules/deferred_analysis	EXPORT_SYMBOL_GPL	
