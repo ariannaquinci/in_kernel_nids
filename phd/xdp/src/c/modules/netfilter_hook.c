@@ -8,6 +8,7 @@
 #include <linux/skbuff.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
+#include <net/netfilter/nf_queue.h>
 
 #include <linux/ip.h>
 #include <linux/udp.h>
@@ -19,7 +20,62 @@ MODULE_AUTHOR("Arianna Quinci");
 MODULE_DESCRIPTION("Netfilter PREROUTING: buffer until deferred analyses complete, drop on malicious verdict");
 
 static atomic_t nf_bypass_seen = ATOMIC_INIT(0);
-static const char * const corr_miss_log_ifname = "enp7s0";
+static const unsigned int dw_nf_queue_num = 0;
+
+#define DW_NFQ_CB_MAGIC 0xC0DEF00D
+
+struct dw_nfq_cb {
+	u32 magic;
+	u32 pkt_id;
+	u32 req_mask;
+} __aligned(4);
+
+static inline struct dw_nfq_cb *dw_nfqcb(struct sk_buff *skb)
+{
+	BUILD_BUG_ON(sizeof(struct dw_nfq_cb) > sizeof(skb->cb));
+	return (struct dw_nfq_cb *)skb->cb;
+}
+
+static int dw_nfqueue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
+{
+	struct sk_buff *skb;
+	struct dw_nfq_cb meta;
+	u32 done = 0;
+	int rc;
+
+	if (!entry || !entry->skb)
+		return -EINVAL;
+
+	skb = entry->skb;
+	meta = *dw_nfqcb(skb);
+	if (meta.magic != DW_NFQ_CB_MAGIC) {
+		pr_err("nfqueue entry missing metadata on queue=%u -> drop\n", queuenum);
+		return -EINVAL;
+	}
+
+	memset(skb->cb, 0, sizeof(skb->cb));
+
+	rc = dw_buffer_nfqueue_entry(entry, meta.pkt_id, meta.req_mask);
+	if (rc < 0) {
+		pr_err("nfqueue buffer failed pkt_id=%u req=0x%x rc=%d\n",
+		       meta.pkt_id, meta.req_mask, rc);
+		nf_reinject(entry, NF_DROP);
+		return 0;
+	}
+
+	if (!dw_are_done(meta.pkt_id, meta.req_mask, &done))
+		pr_info("nfqueue buffered pkt_id=%u req=0x%x done=0x%x: analyses not finished yet\n",
+			meta.pkt_id, meta.req_mask, done);
+	else
+		pr_info("nfqueue buffered pkt_id=%u req=0x%x done=0x%x: queued for ordered delivery\n",
+			meta.pkt_id, meta.req_mask, done);
+
+	return 0;
+}
+
+static const struct nf_queue_handler dw_qh = {
+	.outfn = dw_nfqueue_outfn,
+};
 
 static bool skb_build_key_ipv4_udp(struct sk_buff *skb, struct dw_pkt_key *key)
 {
@@ -73,20 +129,28 @@ static unsigned int dw_nf_prerouting(void *priv,
 
 	/* consuma correlazione prodotta in XDP */
 	if (!dw_meta_get_and_del(&key, &pkt_id, &req_mask)) {
-		if (in_dev && !strcmp(in_dev->name, corr_miss_log_ifname))
-			pr_info("corr miss if=%s ifindex=%d key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u\n",
-				in_dev->name, in_dev->ifindex,
-				ntohl(key.saddr), ntohl(key.daddr),
-				ntohs(key.sport), ntohs(key.dport),
-				ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
+		pr_info("corr miss if=%s ifindex=%d key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u\n",
+			in_dev ? in_dev->name : "?",
+			in_dev ? in_dev->ifindex : -1,
+			ntohl(key.saddr), ntohl(key.daddr),
+			ntohs(key.sport), ntohs(key.dport),
+			ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 		return NF_ACCEPT;
 	}
 
-	pr_info("corr hit key -> pkt_id=%u req=0x%x\n", pkt_id, req_mask);
+	pr_info("corr hit pkt_id=%u req=0x%x key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u\n",
+		pkt_id, req_mask,
+		ntohl(key.saddr), ntohl(key.daddr),
+		ntohs(key.sport), ntohs(key.dport),
+		ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 
 	verdict = dw_get_verdict(pkt_id);
 	if (verdict == DW_VERDICT_DROP) {
-		pr_info("nf verdict DROP pkt_id=%u (drop immediato)\n", pkt_id);
+		pr_info("nf verdict DROP pkt_id=%u key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u (drop immediato)\n",
+			pkt_id,
+			ntohl(key.saddr), ntohl(key.daddr),
+			ntohs(key.sport), ntohs(key.dport),
+			ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 		return NF_DROP;
 	}
 
@@ -95,17 +159,24 @@ static unsigned int dw_nf_prerouting(void *priv,
 	 * Delivery worker drains each flow FIFO only from the flow head.
 	 */
 	if (dw_are_done(pkt_id, req_mask, NULL))
-		pr_info("nf analyses done pkt_id=%u req=0x%x verdict=PASS -> buffering (ordered delivery)\n",
-			pkt_id, req_mask);
+		pr_info("nf analyses done pkt_id=%u req=0x%x key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u verdict=PASS -> queue (ordered delivery)\n",
+			pkt_id, req_mask,
+			ntohl(key.saddr), ntohl(key.daddr),
+			ntohs(key.sport), ntohs(key.dport),
+			ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 	else
-		pr_info("nf analyses pending pkt_id=%u req=0x%x -> buffering\n", pkt_id, req_mask);
+		pr_info("nf analyses pending pkt_id=%u req=0x%x key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u -> queue\n",
+			pkt_id, req_mask,
+			ntohl(key.saddr), ntohl(key.daddr),
+			ntohs(key.sport), ntohs(key.dport),
+			ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 
-	if (dw_buffer_marked_skb(skb, pkt_id, req_mask, 0) < 0) {
-		pr_err("nf buffer failed pkt_id=%u req=0x%x\n", pkt_id, req_mask);
-		return NF_DROP;
-	}
+	memset(skb->cb, 0, sizeof(skb->cb));
+	dw_nfqcb(skb)->magic = DW_NFQ_CB_MAGIC;
+	dw_nfqcb(skb)->pkt_id = pkt_id;
+	dw_nfqcb(skb)->req_mask = req_mask & DW_REQ_MASK_3;
 
-	return NF_STOLEN;
+	return NF_QUEUE_NR(dw_nf_queue_num);
 }
 
 static struct nf_hook_ops nfho = {
@@ -117,8 +188,13 @@ static struct nf_hook_ops nfho = {
 
 static int __init netfilter_hook_init(void)
 {
-	int ret = nf_register_net_hook(&init_net, &nfho);
+	int ret;
+
+	nf_register_queue_handler(&dw_qh);
+
+	ret = nf_register_net_hook(&init_net, &nfho);
 	if (ret) {
+		nf_unregister_queue_handler();
 		pr_err("nf_register_net_hook failed: %d\n", ret);
 		return ret;
 	}
@@ -129,6 +205,7 @@ static int __init netfilter_hook_init(void)
 static void __exit netfilter_hook_exit(void)
 {
 	nf_unregister_net_hook(&init_net, &nfho);
+	nf_unregister_queue_handler();
 	pr_info("unloaded\n");
 }
 
