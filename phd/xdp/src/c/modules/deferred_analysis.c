@@ -516,12 +516,85 @@ struct analysis_work {
 	u32 bit;
 };
 
+static void dw_try_deliver_ready(void)
+{
+	struct flow_ent *fe;
+	struct dw_buf_ent *be;
+	struct hlist_node *tmp;
+	struct nf_queue_entry *qent;
+	int bkt;
+
+	spin_lock_bh(&flow_lock);
+	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
+		for (;;) {
+			u32 pkt_id, req, done;
+			int verdict;
+
+			be = list_first_entry_or_null(&fe->q, struct dw_buf_ent, node);
+			if (!be)
+				break;
+
+			pkt_id = be->pkt_id;
+			req = be->req_mask;
+			verdict = dw_get_verdict(pkt_id);
+
+			if (verdict == DW_VERDICT_DROP) {
+				list_del(&be->node);
+				pr_info("deliver flow-head pkt_id=%u req=0x%x verdict=DROP -> drop queued packet\n",
+					pkt_id, req);
+				spin_unlock_bh(&flow_lock);
+				snap_drop(pkt_id);
+				nf_reinject(be->qent, NF_DROP);
+				kfree(be);
+				atomic_dec(&st_pending);
+				atomic_inc(&st_dropped);
+				spin_lock_bh(&flow_lock);
+				fe->last_seen_jiffies = jiffies;
+				continue;
+			}
+
+			if (!dw_are_done(pkt_id, req, &done)) {
+				pr_info("deliver flow-head pkt_id=%u req=0x%x done=0x%x -> block flow head\n",
+					pkt_id, req, done);
+				break;
+			}
+
+			list_del(&be->node);
+			pr_info("deliver flow-head pkt_id=%u req=0x%x done=0x%x verdict=PASS -> reinject\n",
+				pkt_id, req, done);
+			spin_unlock_bh(&flow_lock);
+			snap_drop(pkt_id);
+
+			qent = be->qent;
+			nf_reinject(qent, NF_ACCEPT);
+			atomic_inc(&st_delivered);
+			kfree(be);
+			atomic_dec(&st_pending);
+
+			spin_lock_bh(&flow_lock);
+			fe->last_seen_jiffies = jiffies;
+		}
+
+		if (list_empty(&fe->q)) {
+			hash_del(&fe->hnode);
+			kfree(fe);
+		}
+	}
+	spin_unlock_bh(&flow_lock);
+}
+
+static void deliver_workfn(struct work_struct *w)
+{
+	dw_try_deliver_ready();
+}
+
 static void analysis_workfn(struct work_struct *w)
 {
 	struct analysis_work *aw = container_of(w, struct analysis_work, work);
 	struct pkt_state *st;
 	u32 req_mask, done, hits;
 	bool is_malicious = false;
+	bool terminal = false;
 	int sig_rc;
 
 	/* Signature check reads the XDP snapshot copied at schedule time. */
@@ -577,9 +650,11 @@ static void analysis_workfn(struct work_struct *w)
 			aw->pkt_id, aw->bit, done, req_mask, hits,
 			(hits & req_mask) ? "DROP" :
 			(((done & req_mask) == req_mask) ? "PASS" : "PENDING"));
-	}
 
-	queue_work(dw_wq, &deliver_work);
+		terminal = (hits & req_mask) || ((done & req_mask) == req_mask);
+	}
+	if (terminal)
+		queue_work(dw_wq, &deliver_work);
 
 	kfree(aw);
 }
@@ -649,9 +724,20 @@ int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_ma
 	struct dw_flow_key fkey;
 	u32 h;
 	struct flow_ent *fe;
+	int verdict;
 
 	if (!entry || !entry->skb)
 		return -EINVAL;
+
+	verdict = dw_get_verdict(pkt_id);
+	if (verdict == DW_VERDICT_DROP) {
+		pr_info("nfqueue immediate drop pkt_id=%u req=0x%x verdict=DROP\n",
+			pkt_id, req_mask & DW_REQ_MASK_3);
+		snap_drop(pkt_id);
+		nf_reinject(entry, NF_DROP);
+		atomic_inc(&st_dropped);
+		return DW_NFQ_DROPPED;
+	}
 
 	if (!skb_build_flow_key_ipv4_udp(entry->skb, &fkey)) {
 		atomic_inc(&st_dropped);
@@ -688,78 +774,9 @@ int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_ma
 
 	atomic_inc(&st_pending);
 	queue_work(dw_wq, &deliver_work);
-	return 1;
+	return DW_NFQ_BUFFERED;
 }
 EXPORT_SYMBOL_GPL(dw_buffer_nfqueue_entry);
-
-/* -------- delivery: reinject ready packets -------- */
-
-static void deliver_workfn(struct work_struct *w)
-{
-	struct flow_ent *fe;
-	struct dw_buf_ent *be;
-	struct hlist_node *tmp;
-	struct nf_queue_entry *qent;
-	int bkt;
-
-	spin_lock_bh(&flow_lock);
-	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
-		for (;;) {
-			u32 pkt_id, req, done;
-			int verdict;
-
-			be = list_first_entry_or_null(&fe->q, struct dw_buf_ent, node);
-			if (!be)
-				break;
-
-			pkt_id = be->pkt_id;
-			req    = be->req_mask;
-			verdict = dw_get_verdict(pkt_id);
-
-			if (verdict == DW_VERDICT_DROP) {
-				list_del(&be->node);
-				pr_info("deliver flow-head pkt_id=%u req=0x%x verdict=DROP -> drop queued packet\n",
-					pkt_id, req);
-				spin_unlock_bh(&flow_lock);
-				snap_drop(pkt_id);
-				nf_reinject(be->qent, NF_DROP);
-				kfree(be);
-				atomic_dec(&st_pending);
-				atomic_inc(&st_dropped);
-				spin_lock_bh(&flow_lock);
-				fe->last_seen_jiffies = jiffies;
-				continue;
-			}
-
-			if (!dw_are_done(pkt_id, req, &done)) {
-				pr_info("deliver flow-head pkt_id=%u req=0x%x done=0x%x -> block flow head\n",
-					pkt_id, req, done);
-				break;
-			}
-
-			list_del(&be->node);
-			pr_info("deliver flow-head pkt_id=%u req=0x%x done=0x%x verdict=PASS -> reinject\n",
-				pkt_id, req, done);
-			spin_unlock_bh(&flow_lock);
-			snap_drop(pkt_id);
-
-			qent = be->qent;
-			nf_reinject(qent, NF_ACCEPT);
-			atomic_inc(&st_delivered);
-			kfree(be);
-			atomic_dec(&st_pending);
-
-			spin_lock_bh(&flow_lock);
-			fe->last_seen_jiffies = jiffies;
-		}
-
-		if (list_empty(&fe->q)) {
-			hash_del(&fe->hnode);
-			kfree(fe);
-		}
-	}
-	spin_unlock_bh(&flow_lock);
-}
 
 /* -------- module init/exit -------- */
 
