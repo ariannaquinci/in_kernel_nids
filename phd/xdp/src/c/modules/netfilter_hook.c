@@ -61,6 +61,11 @@ static int dw_nfqueue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 		nf_reinject(entry, NF_DROP);
 		return 0;
 	}
+	if (rc == DW_NFQ_DROPPED) {
+		pr_info("nfqueue immediate drop pkt_id=%u req=0x%x: verdict already DROP\n",
+			meta.pkt_id, meta.req_mask);
+		return 0;
+	}
 
 	if (!dw_are_done(meta.pkt_id, meta.req_mask, &done))
 		pr_info("nfqueue buffered pkt_id=%u req=0x%x done=0x%x: analyses not finished yet\n",
