@@ -101,7 +101,6 @@ static DEFINE_HASHTABLE(flow_ht, FLOW_BITS);
 static DEFINE_SPINLOCK(flow_lock);
 
 static struct workqueue_struct *dw_wq;
-static struct work_struct deliver_work;
 
 /* -------- stats/debug -------- */
 
@@ -109,6 +108,8 @@ static atomic_t st_pending   = ATOMIC_INIT(0);
 static atomic_t st_delivered = ATOMIC_INIT(0);
 static atomic_t st_dropped   = ATOMIC_INIT(0);
 static atomic_t rr_cpu       = ATOMIC_INIT(0);
+static atomic_t delivery_running = ATOMIC_INIT(0);
+static atomic_t delivery_kicked  = ATOMIC_INIT(0);
 
 #define DW_DUMMY_NEEDLE "malicious"
 
@@ -516,7 +517,7 @@ struct analysis_work {
 	u32 bit;
 };
 
-static void dw_try_deliver_ready(void)
+static void __dw_try_deliver_ready(void)
 {
 	struct flow_ent *fe;
 	struct dw_buf_ent *be;
@@ -583,9 +584,41 @@ static void dw_try_deliver_ready(void)
 	spin_unlock_bh(&flow_lock);
 }
 
-static void deliver_workfn(struct work_struct *w)
+static void dw_try_deliver_ready(void)
 {
-	dw_try_deliver_ready();
+	atomic_set(&delivery_kicked, 1);
+
+	if (atomic_cmpxchg(&delivery_running, 0, 1) != 0)
+		return;
+
+	for (;;) {
+		/*
+		 * Only one drainer may walk flow_ht at a time. The delivery
+		 * path drops flow_lock around nf_reinject(), so concurrent
+		 * drainers can otherwise free the same flow while another
+		 * caller still holds a raw pointer to it.
+		 */
+		atomic_set(&delivery_kicked, 0);
+		__dw_try_deliver_ready();
+		smp_mb__after_atomic();
+		if (!atomic_read(&delivery_kicked))
+			break;
+	}
+
+	atomic_set(&delivery_running, 0);
+	smp_mb__after_atomic();
+
+	if (atomic_xchg(&delivery_kicked, 0) &&
+	    atomic_cmpxchg(&delivery_running, 0, 1) == 0) {
+		for (;;) {
+			atomic_set(&delivery_kicked, 0);
+			__dw_try_deliver_ready();
+			smp_mb__after_atomic();
+			if (!atomic_read(&delivery_kicked))
+				break;
+		}
+		atomic_set(&delivery_running, 0);
+	}
 }
 
 static void analysis_workfn(struct work_struct *w)
@@ -654,7 +687,7 @@ static void analysis_workfn(struct work_struct *w)
 		terminal = (hits & req_mask) || ((done & req_mask) == req_mask);
 	}
 	if (terminal)
-		queue_work(dw_wq, &deliver_work);
+		dw_try_deliver_ready();
 
 	kfree(aw);
 }
@@ -773,7 +806,7 @@ int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_ma
 	spin_unlock_bh(&flow_lock);
 
 	atomic_inc(&st_pending);
-	queue_work(dw_wq, &deliver_work);
+	dw_try_deliver_ready();
 	return DW_NFQ_BUFFERED;
 }
 EXPORT_SYMBOL_GPL(dw_buffer_nfqueue_entry);
@@ -792,8 +825,6 @@ static int __init deferred_init(void)
 	dw_wq = alloc_workqueue("dw_wq", WQ_UNBOUND | WQ_HIGHPRI, 0);
 	if (!dw_wq)
 		return -ENOMEM;
-
-	INIT_WORK(&deliver_work, deliver_workfn);
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &dw_kfunc_ids);
 	if (ret) {
