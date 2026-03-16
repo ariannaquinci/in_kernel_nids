@@ -19,7 +19,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Arianna Quinci");
 MODULE_DESCRIPTION("Netfilter PREROUTING: buffer until deferred analyses complete, drop on malicious verdict");
 
-static atomic_t nf_bypass_seen = ATOMIC_INIT(0);
 static const unsigned int dw_nf_queue_num = 0;
 
 #define DW_NFQ_CB_MAGIC 0xC0DEF00D
@@ -114,14 +113,6 @@ static unsigned int dw_nf_prerouting(void *priv,
 
 	if (!skb)
 		return NF_ACCEPT;
-
-	/* reinjected packets bypass all logic */
-	if (dw_is_bypass_skb(skb)) {
-		int n = atomic_inc_return(&nf_bypass_seen);
-		pr_info("bypass reinjected skb count=%d mark=0x%x -> accept\n", n, skb->mark);
-		skb->mark = 0;
-		return NF_ACCEPT;
-	}
 
 	/* solo IPv4/UDP */
 	if (!skb_build_key_ipv4_udp(skb, &key))
