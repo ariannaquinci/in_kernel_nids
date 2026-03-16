@@ -15,7 +15,6 @@
 #include <linux/if_ether.h>
 
 #include <linux/skbuff.h>
-#include <linux/netdevice.h>
 #include <linux/hashtable.h>
 #include <net/netfilter/nf_queue.h>
 
@@ -25,24 +24,6 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Arianna Quinci");
-
-/* -------- bypass cb (per reinjection) -------- */
-
-#define DW_BYPASS_MARK  0xDEADDEAD
-#define DW_CB_MAGIC     0xDA7ADA7A
-
-struct dw_cb {
-	u32 bypass_mark;
-	u32 magic;
-	u32 pkt_id;
-	u32 req_mask;
-} __aligned(4);
-
-static inline struct dw_cb *dwcb(struct sk_buff *skb)
-{
-	BUILD_BUG_ON(sizeof(struct dw_cb) > sizeof(skb->cb));
-	return (struct dw_cb *)skb->cb;
-}
 
 /* -------- per-packet analysis state -------- */
 
@@ -108,15 +89,8 @@ struct flow_ent {
 	struct hlist_node hnode;
 };
 
-enum dw_buf_kind {
-	DW_BUF_LEGACY_SKB = 0,
-	DW_BUF_NFQ_ENTRY  = 1,
-};
-
 struct dw_buf_ent {
 	struct list_head node;
-	enum dw_buf_kind kind;
-	struct sk_buff *skb;
 	struct nf_queue_entry *qent;
 	u32 pkt_id;
 	u32 req_mask;
@@ -669,73 +643,6 @@ static const struct btf_kfunc_id_set dw_kfunc_ids = {
 
 /* -------- API used by Netfilter -------- */
 
-bool dw_is_bypass_skb(struct sk_buff *skb)
-{
-	return skb && skb->mark == DW_BYPASS_MARK;
-}
-EXPORT_SYMBOL_GPL(dw_is_bypass_skb);
-
-int dw_buffer_marked_skb(struct sk_buff *skb, u32 pkt_id, u32 req_mask, u32 mark_dummy)
-{
-	struct dw_buf_ent *be;
-	struct sk_buff *nskb;
-	struct dw_flow_key fkey;
-	u32 h;
-	struct flow_ent *fe;
-
-	nskb = skb_copy(skb, GFP_ATOMIC);
-	if (!nskb) {
-		atomic_inc(&st_dropped);
-		return -ENOMEM;
-	}
-
-	if (!skb_build_flow_key_ipv4_udp(nskb, &fkey)) {
-		kfree_skb(nskb);
-		atomic_inc(&st_dropped);
-		return -EINVAL;
-	}
-
-	memset(nskb->cb, 0, sizeof(nskb->cb));
-	dwcb(nskb)->magic = DW_CB_MAGIC;
-	dwcb(nskb)->bypass_mark = 0;
-	dwcb(nskb)->pkt_id = pkt_id;
-	dwcb(nskb)->req_mask = req_mask & DW_REQ_MASK_3;
-
-	nskb->mark = mark_dummy;
-
-	be = kzalloc(sizeof(*be), GFP_ATOMIC);
-	if (!be) {
-		kfree_skb(nskb);
-		atomic_inc(&st_dropped);
-		return -ENOMEM;
-	}
-	be->kind = DW_BUF_LEGACY_SKB;
-	be->skb = nskb;
-	be->qent = NULL;
-	be->pkt_id = pkt_id;
-	be->req_mask = req_mask & DW_REQ_MASK_3;
-
-	h = jhash(&fkey, sizeof(fkey), 0);
-	spin_lock_bh(&flow_lock);
-	fe = flow_get_or_create_locked(&fkey, h);
-	if (!fe) {
-		spin_unlock_bh(&flow_lock);
-		kfree_skb(nskb);
-		kfree(be);
-		atomic_inc(&st_dropped);
-		return -ENOMEM;
-	}
-	list_add_tail(&be->node, &fe->q);
-	fe->last_seen_jiffies = jiffies;
-	spin_unlock_bh(&flow_lock);
-
-	atomic_inc(&st_pending);
-
-	queue_work(dw_wq, &deliver_work);
-	return 1;
-}
-EXPORT_SYMBOL_GPL(dw_buffer_marked_skb);
-
 int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_mask)
 {
 	struct dw_buf_ent *be;
@@ -756,8 +663,6 @@ int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_ma
 		atomic_inc(&st_dropped);
 		return -ENOMEM;
 	}
-	be->kind = DW_BUF_NFQ_ENTRY;
-	be->skb = NULL;
 	be->qent = entry;
 	be->pkt_id = pkt_id;
 	be->req_mask = req_mask & DW_REQ_MASK_3;
@@ -791,15 +696,11 @@ EXPORT_SYMBOL_GPL(dw_buffer_nfqueue_entry);
 
 static void deliver_workfn(struct work_struct *w)
 {
-	struct net_device *lo;
 	struct flow_ent *fe;
 	struct dw_buf_ent *be;
 	struct hlist_node *tmp;
-	struct sk_buff *skb, *nskb;
 	struct nf_queue_entry *qent;
 	int bkt;
-
-	lo = NULL;
 
 	spin_lock_bh(&flow_lock);
 	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
@@ -821,10 +722,7 @@ static void deliver_workfn(struct work_struct *w)
 					pkt_id, req);
 				spin_unlock_bh(&flow_lock);
 				snap_drop(pkt_id);
-				if (be->kind == DW_BUF_NFQ_ENTRY)
-					nf_reinject(be->qent, NF_DROP);
-				else
-					kfree_skb(be->skb);
+				nf_reinject(be->qent, NF_DROP);
 				kfree(be);
 				atomic_dec(&st_pending);
 				atomic_inc(&st_dropped);
@@ -845,50 +743,9 @@ static void deliver_workfn(struct work_struct *w)
 			spin_unlock_bh(&flow_lock);
 			snap_drop(pkt_id);
 
-			if (be->kind == DW_BUF_NFQ_ENTRY) {
-				qent = be->qent;
-				nf_reinject(qent, NF_ACCEPT);
-				atomic_inc(&st_delivered);
-			} else {
-				skb = be->skb;
-				if (!lo) {
-					lo = dev_get_by_name(&init_net, "lo");
-					if (!lo) {
-						pr_err("loopback not found\n");
-						kfree_skb(skb);
-						kfree(be);
-						atomic_dec(&st_pending);
-						atomic_inc(&st_dropped);
-						spin_lock_bh(&flow_lock);
-						fe->last_seen_jiffies = jiffies;
-						continue;
-					}
-				}
-
-				nskb = skb_copy(skb, GFP_KERNEL);
-				if (!nskb) {
-					kfree_skb(skb);
-					kfree(be);
-					atomic_dec(&st_pending);
-					atomic_inc(&st_dropped);
-					spin_lock_bh(&flow_lock);
-					continue;
-				}
-
-				memset(nskb->cb, 0, sizeof(nskb->cb));
-				nskb->mark = DW_BYPASS_MARK;
-				nskb->dev = lo;
-				nskb->protocol = htons(ETH_P_IP);
-				nskb->pkt_type = PACKET_HOST;
-				nskb->ip_summed = CHECKSUM_NONE;
-
-				if (netif_receive_skb(nskb) == NET_RX_SUCCESS)
-					atomic_inc(&st_delivered);
-				else
-					atomic_inc(&st_dropped);
-
-				kfree_skb(skb);
-			}
+			qent = be->qent;
+			nf_reinject(qent, NF_ACCEPT);
+			atomic_inc(&st_delivered);
 			kfree(be);
 			atomic_dec(&st_pending);
 
@@ -902,9 +759,6 @@ static void deliver_workfn(struct work_struct *w)
 		}
 	}
 	spin_unlock_bh(&flow_lock);
-
-	if (lo)
-		dev_put(lo);
 }
 
 /* -------- module init/exit -------- */
@@ -970,10 +824,7 @@ static void __exit deferred_exit(void)
 		hash_del(&fe->hnode);
 		list_for_each_entry_safe(be, be_tmp, &fe->q, node) {
 			list_del(&be->node);
-			if (be->kind == DW_BUF_NFQ_ENTRY)
-				nf_queue_entry_free(be->qent);
-			else
-				kfree_skb(be->skb);
+			nf_queue_entry_free(be->qent);
 			kfree(be);
 		}
 		kfree(fe);

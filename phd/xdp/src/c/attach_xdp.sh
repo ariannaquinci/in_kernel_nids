@@ -3,12 +3,22 @@
 
 set -euo pipefail
 
-XDP_OBJ=".output/xdp.bpf.o"
-TC_OBJ=".output/tc_ingress.bpf.o"
+OUTPUT_DIR="${OUTPUT_DIR:-.output}"
+XDP_OBJ="$OUTPUT_DIR/xdp.bpf.o"
+TC_OBJ="$OUTPUT_DIR/tc_ingress.bpf.o"
 
 BPFFS_PATH="/sys/fs/bpf/xdp_nids"
-IFACE="${1:-enp7s0}"
-ATTACH_TC_ON_LO="${2:-0}"   # passa "1" come secondo argomento se vuoi anche su lo
+IFACE="${1:-${XDP_IFACE:-}}"
+
+if [[ -z "$IFACE" ]]; then
+    for dev in /sys/class/net/*; do
+        dev="${dev##*/}"
+        if [[ "$dev" != "lo" ]]; then
+            IFACE="$dev"
+            break
+        fi
+    done
+fi
 
 # 1. Check file e interfaccia
 [[ ! -f "$XDP_OBJ" ]] && { echo "ERRORE: $XDP_OBJ mancante"; exit 1; }
@@ -63,14 +73,6 @@ sudo tc qdisc add dev "$IFACE" clsact 2>/dev/null || true
 
 echo "SUCCESS: TC ingress attached su $IFACE"
 
-# opzionale: se reinietti su lo e vuoi marcare anche quelli
-if [[ "$ATTACH_TC_ON_LO" == "1" ]]; then
-  echo "Attach TC ingress anche su lo (per pacchetti reiniettati)..."
-  sudo tc qdisc add dev lo clsact 2>/dev/null || true
-  #sudo tc filter replace dev lo ingress bpf da obj "$TC_OBJ" sec "tc"
-  echo "SUCCESS: TC ingress attached su lo"
-fi
-
 echo ""
 echo "=== STATO XDP ==="
 sudo bpftool net show dev "$IFACE"
@@ -78,12 +80,6 @@ sudo bpftool net show dev "$IFACE"
 echo ""
 echo "=== STATO TC ingress ($IFACE) ==="
 tc filter show dev "$IFACE" ingress || true
-
-if [[ "$ATTACH_TC_ON_LO" == "1" ]]; then
-  echo ""
-  echo "=== STATO TC ingress (lo) ==="
-  tc filter show dev lo ingress || true
-fi
 
 echo ""
 echo "Logs (kfunc calls):"
