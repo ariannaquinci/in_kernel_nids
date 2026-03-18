@@ -5,10 +5,12 @@ set -euo pipefail
 
 OUTPUT_DIR="${OUTPUT_DIR:-.output}"
 XDP_OBJ="$OUTPUT_DIR/xdp.bpf.o"
+WORKLOAD_OBJ="$OUTPUT_DIR/workload_collector.bpf.o"
 TC_OBJ="$OUTPUT_DIR/tc_ingress.bpf.o"
 
 BPFFS_PATH="/sys/fs/bpf/xdp_nids"
 IFACE="${1:-${XDP_IFACE:-}}"
+SHARED_WORKLOAD_MAP="$BPFFS_PATH/maps/workload_state_map"
 
 if [[ -z "$IFACE" ]]; then
     for dev in /sys/class/net/*; do
@@ -22,6 +24,7 @@ fi
 
 # 1. Check file e interfaccia
 [[ ! -f "$XDP_OBJ" ]] && { echo "ERRORE: $XDP_OBJ mancante"; exit 1; }
+[[ ! -f "$WORKLOAD_OBJ" ]] && { echo "ERRORE: $WORKLOAD_OBJ mancante"; exit 1; }
 #[[ ! -f "$TC_OBJ"  ]] && { echo "ERRORE: $TC_OBJ mancante (compila tc_ingress.bpf.c)"; exit 1; }
 
 [[ ! -d "/sys/class/net/$IFACE" ]] && {
@@ -31,6 +34,7 @@ fi
 }
 
 echo "XDP OBJ: $XDP_OBJ"
+echo "Workload collector OBJ: $WORKLOAD_OBJ"
 #echo "TC  OBJ: $TC_OBJ"
 echo "IFACE:   $IFACE"
 
@@ -48,6 +52,16 @@ else
     echo "WARNING: Fallback: Load senza pinmaps..."
     sudo bpftool prog load "$XDP_OBJ" "$PROG_PIN" type xdp
 fi
+
+COLLECTOR_PIN="$BPFFS_PATH/progs/workload_collector"
+echo "Load & auto-attach workload collector..."
+[[ -e "$SHARED_WORKLOAD_MAP" ]] || {
+    echo "FAIL: mappa condivisa non trovata: $SHARED_WORKLOAD_MAP"
+    exit 1
+}
+sudo bpftool prog load "$WORKLOAD_OBJ" "$COLLECTOR_PIN" type tracepoint \
+    map name workload_state_map pinned "$SHARED_WORKLOAD_MAP" \
+    autoattach
 
 # 4. ATTACH XDP
 echo "Attach XDP su $IFACE..."

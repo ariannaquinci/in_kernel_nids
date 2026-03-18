@@ -68,13 +68,24 @@ $(call allow-override,CC,$(CROSS_COMPILE)cc)
 $(call allow-override,LD,$(CROSS_COMPILE)ld)
 
 .PHONY: all
-all: $(OUTPUT)/xdp.bpf.o
+all: $(OUTPUT)/xdp.bpf.o $(OUTPUT)/workload_collector.bpf.o
 
 
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
 	$(Q)rm -rf $(OUTPUT) $(APPS)
+
+.PHONY: detach
+detach:
+	./detach_xdp.sh $(IFACE)
+
+.PHONY: teardown
+teardown:
+	./detach_xdp_unload_modules.sh $(IFACE)
+
+.PHONY: unload
+unload: teardown
 
 $(OUTPUT) $(OUTPUT)/libbpf $(BPFTOOL_OUTPUT):
 	$(call msg,MKDIR,$@)

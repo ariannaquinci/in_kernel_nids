@@ -18,8 +18,12 @@ bool dw_are_done(u32 pkt_id, u32 req_mask, u32 *done_out);
 int  dw_get_verdict(u32 pkt_id);
 void dw_note_payload_signature(u32 pkt_id, u32 req_mask, bool is_malicious);
 
+bool dw_nfqueue_is_stopping(void);
+void dw_begin_nfqueue_stop(void);
+
 /* bufferizzazione via NFQUEUE: 1 buffered, 0 dropped immediately */
 int  dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_mask);
+void dw_quiesce_nfqueue(void);
 
 /* correlazione XDP->skb */
 bool dw_meta_get_and_del(struct dw_pkt_key *key, u32 *pkt_id_out, u32 *req_mask_out);

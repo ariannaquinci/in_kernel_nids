@@ -20,6 +20,8 @@ MODULE_AUTHOR("Arianna Quinci");
 MODULE_DESCRIPTION("Netfilter PREROUTING: buffer until deferred analyses complete, drop on malicious verdict");
 
 static const unsigned int dw_nf_queue_num = 0;
+static bool dw_queue_handler_registered;
+static bool dw_net_hook_registered;
 
 #define DW_NFQ_CB_MAGIC 0xC0DEF00D
 
@@ -42,14 +44,17 @@ static int dw_nfqueue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 	u32 done = 0;
 	int rc;
 
-	if (!entry || !entry->skb)
-		return -EINVAL;
+	if (!entry || !entry->skb) {
+		pr_err("nfqueue entry invalid on queue=%u\n", queuenum);
+		return 0;
+	}
 
 	skb = entry->skb;
 	meta = *dw_nfqcb(skb);
 	if (meta.magic != DW_NFQ_CB_MAGIC) {
-		pr_err("nfqueue entry missing metadata on queue=%u -> drop\n", queuenum);
-		return -EINVAL;
+		pr_err("nfqueue entry missing metadata on queue=%u -> accept\n", queuenum);
+		nf_reinject(entry, NF_ACCEPT);
+		return 0;
 	}
 
 	memset(skb->cb, 0, sizeof(skb->cb));
@@ -77,8 +82,19 @@ static int dw_nfqueue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 	return 0;
 }
 
+static void dw_nfqueue_hook_drop(struct net *net)
+{
+	/*
+	 * nf_unregister_net_hook() expects a valid nf_hook_drop callback while
+	 * a queue handler is registered. Keep it non-recursive here and let the
+	 * explicit dw_quiesce_nfqueue() in module exit drain queued packets.
+	 */
+	dw_begin_nfqueue_stop();
+}
+
 static const struct nf_queue_handler dw_qh = {
 	.outfn = dw_nfqueue_outfn,
+	.nf_hook_drop = dw_nfqueue_hook_drop,
 };
 
 static bool skb_build_key_ipv4_udp(struct sk_buff *skb, struct dw_pkt_key *key)
@@ -140,6 +156,12 @@ static unsigned int dw_nf_prerouting(void *priv,
 		ntohs(key.sport), ntohs(key.dport),
 		ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 
+	if (dw_nfqueue_is_stopping()) {
+		pr_info("nf teardown stopping pkt_id=%u req=0x%x -> accept without queue\n",
+			pkt_id, req_mask);
+		return NF_ACCEPT;
+	}
+
 	verdict = dw_get_verdict(pkt_id);
 	if (verdict == DW_VERDICT_DROP) {
 		pr_info("nf verdict DROP pkt_id=%u key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u (drop immediato)\n",
@@ -187,21 +209,52 @@ static int __init netfilter_hook_init(void)
 	int ret;
 
 	nf_register_queue_handler(&dw_qh);
+	dw_queue_handler_registered = true;
 
 	ret = nf_register_net_hook(&init_net, &nfho);
 	if (ret) {
-		nf_unregister_queue_handler();
+		if (dw_queue_handler_registered) {
+			nf_unregister_queue_handler();
+			dw_queue_handler_registered = false;
+		}
 		pr_err("nf_register_net_hook failed: %d\n", ret);
 		return ret;
 	}
+	dw_net_hook_registered = true;
 	pr_info("loaded\n");
 	return 0;
 }
 
 static void __exit netfilter_hook_exit(void)
 {
-	nf_unregister_net_hook(&init_net, &nfho);
-	nf_unregister_queue_handler();
+	pr_info("unload: entered netfilter_hook_exit\n");
+	pr_info("unload: begin nfqueue stop\n");
+	dw_begin_nfqueue_stop();
+	pr_info("unload: completed dw_begin_nfqueue_stop\n");
+
+	if (dw_net_hook_registered) {
+		pr_info("unload: before nf_unregister_net_hook\n");
+		nf_unregister_net_hook(&init_net, &nfho);
+		pr_info("unload: after nf_unregister_net_hook\n");
+		dw_net_hook_registered = false;
+
+		pr_info("unload: before synchronize_net\n");
+		synchronize_net();
+		pr_info("unload: after synchronize_net\n");
+	}
+
+	if (dw_queue_handler_registered) {
+		pr_info("unload: before dw_quiesce_nfqueue\n");
+		dw_quiesce_nfqueue();
+		pr_info("unload: after dw_quiesce_nfqueue\n");
+
+		pr_info("unload: before nf_unregister_queue_handler\n");
+		nf_unregister_queue_handler();
+		pr_info("unload: after nf_unregister_queue_handler\n");
+		dw_queue_handler_registered = false;
+	}
+
+	pr_info("unload: leaving netfilter_hook_exit\n");
 	pr_info("unloaded\n");
 }
 
