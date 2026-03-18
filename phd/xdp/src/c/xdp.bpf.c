@@ -3,6 +3,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "modules/dw_shared.h"
+#include "workload_shared.h"
 
 #define ETH_P_IP 0x0800
 #define ETH_P_8021Q 0x8100
@@ -33,6 +34,13 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } meta_put_fail_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct workload_state);
+} workload_state_map SEC(".maps");
 
 static __always_inline __u32 next_pkt_id(void)
 {
@@ -87,6 +95,9 @@ int xdp_prog(struct xdp_md *ctx)
 	int i;
 	int rc;
 	__u32 frame_len;
+	__u32 req_mask = DW_REQ_MASK_3;
+	__u32 budget_key = DW_WORKLOAD_MAP_KEY;
+	struct workload_state *ws;
 
 	if ((void *)(eth + 1) > data_end)
 		return XDP_PASS;
@@ -143,14 +154,20 @@ int xdp_prog(struct xdp_md *ctx)
 	if (rc < 0)
 		bpf_printk("dw_pkt_snapshot_put failed rc=%d pkt_id=%u", rc, pkt_id);
 
+	ws = bpf_map_lookup_elem(&workload_state_map, &budget_key);
+	if (ws)
+		req_mask = dw_apply_deferred_budget(req_mask, ws->deferred_budget);
+	else
+		req_mask = dw_apply_deferred_budget(req_mask, DW_WORKLOAD_DEFAULT_BUDGET);
+
 	/* 1) registra correlazione */
-	rc = dw_meta_put(&key, pkt_id, DW_REQ_MASK_3);
+	rc = dw_meta_put(&key, pkt_id, req_mask);
 	count_meta_put_fail(rc);
 	if (rc < 0)
 		return XDP_PASS;
 
 	/* 2) schedule analisi */
-	dw_register_and_schedule(pkt_id, DW_REQ_MASK_3);
+	dw_register_and_schedule(pkt_id, req_mask);
 
 	return XDP_PASS;
 }

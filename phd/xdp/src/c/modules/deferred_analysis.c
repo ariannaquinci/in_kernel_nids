@@ -11,6 +11,9 @@
 #include <linux/atomic.h>
 #include <linux/spinlock.h>
 #include <linux/jiffies.h>
+#include <linux/delay.h>
+#include <linux/netdevice.h>
+#include <linux/rcupdate.h>
 #include <linux/udp.h>
 #include <linux/if_ether.h>
 
@@ -110,6 +113,9 @@ static atomic_t st_dropped   = ATOMIC_INIT(0);
 static atomic_t rr_cpu       = ATOMIC_INIT(0);
 static atomic_t delivery_running = ATOMIC_INIT(0);
 static atomic_t delivery_kicked  = ATOMIC_INIT(0);
+static atomic_t nfq_stopping     = ATOMIC_INIT(0);
+static atomic_t nfq_quiescing    = ATOMIC_INIT(0);
+static atomic_t dw_stopping      = ATOMIC_INIT(0);
 
 #define DW_DUMMY_NEEDLE "malicious"
 
@@ -346,6 +352,23 @@ bool dw_are_done(u32 pkt_id, u32 req_mask, u32 *done_out)
 }
 EXPORT_SYMBOL_GPL(dw_are_done);
 
+bool dw_nfqueue_is_stopping(void)
+{
+	return atomic_read(&nfq_stopping) != 0;
+}
+EXPORT_SYMBOL_GPL(dw_nfqueue_is_stopping);
+
+void dw_begin_nfqueue_stop(void)
+{
+	atomic_set(&nfq_stopping, 1);
+}
+EXPORT_SYMBOL_GPL(dw_begin_nfqueue_stop);
+
+static bool dw_module_is_stopping(void)
+{
+	return atomic_read(&dw_stopping) != 0;
+}
+
 /* -------- meta store: used by XDP (put) and NF (get+del) -------- */
 
 static bool key_equal(const struct dw_pkt_key *a, const struct dw_pkt_key *b)
@@ -425,6 +448,9 @@ static __bpf_kfunc int dw_meta_put(struct dw_pkt_key *key, u32 pkt_id, u32 req_m
 	struct meta_ent *e;
 	u32 h;
 
+	if (dw_module_is_stopping())
+		return -ESHUTDOWN;
+
 	if (!key || !pkt_id || !(req_mask & DW_REQ_MASK_3))
 		return -EINVAL;
 
@@ -450,6 +476,9 @@ static __bpf_kfunc int dw_pkt_snapshot_put(const u8 *data, u32 len, u32 pkt_id)
 {
 	struct pkt_snap_ent *e, *old;
 	u32 cap_len;
+
+	if (dw_module_is_stopping())
+		return -ESHUTDOWN;
 
 	if (!data || !len || !pkt_id)
 		return -EINVAL;
@@ -523,6 +552,7 @@ static void __dw_try_deliver_ready(void)
 	struct dw_buf_ent *be;
 	struct hlist_node *tmp;
 	struct nf_queue_entry *qent;
+	bool stopping;
 	int bkt;
 
 	spin_lock_bh(&flow_lock);
@@ -537,7 +567,23 @@ static void __dw_try_deliver_ready(void)
 
 			pkt_id = be->pkt_id;
 			req = be->req_mask;
+			stopping = atomic_read(&nfq_stopping);
 			verdict = dw_get_verdict(pkt_id);
+
+			if (stopping) {
+				list_del(&be->node);
+				pr_info("deliver flow-head pkt_id=%u req=0x%x teardown -> accept queued packet\n",
+					pkt_id, req);
+				spin_unlock_bh(&flow_lock);
+				snap_drop(pkt_id);
+				nf_reinject(be->qent, NF_ACCEPT);
+				kfree(be);
+				atomic_dec(&st_pending);
+				atomic_inc(&st_delivered);
+				spin_lock_bh(&flow_lock);
+				fe->last_seen_jiffies = jiffies;
+				continue;
+			}
 
 			if (verdict == DW_VERDICT_DROP) {
 				list_del(&be->node);
@@ -641,11 +687,6 @@ static void analysis_workfn(struct work_struct *w)
 		is_malicious = false;
 		break;
 	case DW_REQ_A3:
-		//fsleep(10);
-		if(aw->pkt_id%5==0){
-			printk("DELAIED PACKET");
-			fsleep(10);
-		}
 		sig_rc = snapshot_pkt_payload_contains(aw->pkt_id, DW_DUMMY_NEEDLE,
 						       &is_malicious);
 		if (sig_rc < 0)
@@ -699,6 +740,9 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 	int id;
 	int cpu, ncpus;
 	struct pkt_state *st;
+
+	if (dw_module_is_stopping())
+		return -ESHUTDOWN;
 
 	if (!req_mask)
 		return 0;
@@ -762,6 +806,15 @@ int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_ma
 	if (!entry || !entry->skb)
 		return -EINVAL;
 
+	if (atomic_read(&nfq_stopping)) {
+		pr_info("nfqueue stopping pkt_id=%u req=0x%x -> accept queued packet\n",
+			pkt_id, req_mask & DW_REQ_MASK_3);
+		snap_drop(pkt_id);
+		nf_reinject(entry, NF_ACCEPT);
+		atomic_inc(&st_delivered);
+		return DW_NFQ_DROPPED;
+	}
+
 	verdict = dw_get_verdict(pkt_id);
 	if (verdict == DW_VERDICT_DROP) {
 		pr_info("nfqueue immediate drop pkt_id=%u req=0x%x verdict=DROP\n",
@@ -811,6 +864,61 @@ int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_ma
 }
 EXPORT_SYMBOL_GPL(dw_buffer_nfqueue_entry);
 
+void dw_quiesce_nfqueue(void)
+{
+	LIST_HEAD(drop_list);
+	struct flow_ent *fe;
+	struct dw_buf_ent *be, *be_tmp;
+	struct hlist_node *tmp;
+	int bkt;
+
+	if (atomic_cmpxchg(&nfq_quiescing, 0, 1) != 0) {
+		pr_info("nfqueue quiesce already in progress\n");
+		return;
+	}
+
+	atomic_set(&nfq_stopping, 1);
+	/*
+	 * Wait for any in-flight netfilter callbacks to finish before we
+	 * claim delivery ownership and tear down queued entries.
+	 */
+	synchronize_net();
+	flush_workqueue(dw_wq);
+
+	while (atomic_cmpxchg(&delivery_running, 0, 1) != 0)
+		usleep_range(1000, 2000);
+
+	spin_lock_bh(&flow_lock);
+	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
+		hash_del(&fe->hnode);
+		list_for_each_entry_safe(be, be_tmp, &fe->q, node) {
+			list_del(&be->node);
+			list_add_tail(&be->node, &drop_list);
+		}
+		kfree(fe);
+	}
+	spin_unlock_bh(&flow_lock);
+
+	list_for_each_entry_safe(be, be_tmp, &drop_list, node) {
+		list_del(&be->node);
+		snap_drop(be->pkt_id);
+		/*
+		 * Complete each queued packet through NFQUEUE before unregistering
+		 * the queue handler, otherwise the queue core may still consider
+		 * the entry in flight and stall module teardown.
+		 */
+		nf_reinject(be->qent, NF_ACCEPT);
+		atomic_dec(&st_pending);
+		atomic_inc(&st_delivered);
+		kfree(be);
+	}
+
+	atomic_set(&delivery_kicked, 0);
+	atomic_set(&delivery_running, 0);
+	atomic_set(&nfq_quiescing, 0);
+}
+EXPORT_SYMBOL_GPL(dw_quiesce_nfqueue);
+
 /* -------- module init/exit -------- */
 
 static int __init deferred_init(void)
@@ -821,6 +929,11 @@ static int __init deferred_init(void)
 	hash_init(meta_ht);
 	hash_init(flow_ht);
 	hash_init(snap_ht);
+	atomic_set(&nfq_stopping, 0);
+	atomic_set(&nfq_quiescing, 0);
+	atomic_set(&delivery_running, 0);
+	atomic_set(&delivery_kicked, 0);
+	atomic_set(&dw_stopping, 0);
 
 	dw_wq = alloc_workqueue("dw_wq", WQ_UNBOUND | WQ_HIGHPRI, 0);
 	if (!dw_wq)
@@ -847,8 +960,21 @@ static void __exit deferred_exit(void)
 	struct hlist_node *tmp;
 	int bkt;
 
-	
-	destroy_workqueue(dw_wq);
+	/*
+	 * Expected teardown is: detach XDP/eBPF first, then unload netfilter,
+	 * and only after that unload deferred_analysis. Mark the module as
+	 * stopping and wait for the last in-flight XDP/kfunc users before we
+	 * tear down NFQUEUE state, the worker pool and the backing hash tables.
+	 */
+	atomic_set(&dw_stopping, 1);
+	atomic_set(&nfq_stopping, 1);
+	synchronize_net();
+	synchronize_rcu();
+	dw_quiesce_nfqueue();
+	if (dw_wq) {
+		destroy_workqueue(dw_wq);
+		dw_wq = NULL;
+	}
 
 	/* cleanup state_ht */
 	spin_lock_bh(&state_lock);

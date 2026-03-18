@@ -3,6 +3,7 @@ obj-m += netfilter_hook.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
+TEARDOWN := $(abspath $(PWD)/../detach_xdp_unload_modules.sh)
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -11,9 +12,10 @@ all:
 deferred_analysis:
 	$(MAKE) -C $(KDIR) M=$(PWD) deferred_analysis.ko
 
-# Build solo netfilter_hook
+# Build netfilter_hook after generating Module.symvers for deferred_analysis
 netfilter_hook:
-	$(MAKE) -C $(KDIR) M=$(PWD) netfilter_hook.ko
+	$(MAKE) -C $(KDIR) M=$(PWD) deferred_analysis.ko
+	$(MAKE) -C $(KDIR) M=$(PWD) KBUILD_EXTRA_SYMBOLS=$(PWD)/Module.symvers netfilter_hook.ko
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
@@ -23,5 +25,10 @@ load:
 	insmod netfilter_hook.ko
 
 unload:
-	rmmod netfilter_hook
-	rmmod deferred_analysis
+	@if [ -x "$(TEARDOWN)" ]; then \
+		"$(TEARDOWN)"; \
+	else \
+		echo "missing teardown script: $(TEARDOWN)" >&2; \
+		exit 1; \
+	fi
+
