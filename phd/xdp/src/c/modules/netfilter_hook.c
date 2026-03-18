@@ -17,7 +17,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Arianna Quinci");
-MODULE_DESCRIPTION("Netfilter PREROUTING: buffer until deferred analyses complete, drop on malicious verdict");
+MODULE_DESCRIPTION("Netfilter LOCAL_IN: buffer until deferred analyses complete, drop on malicious verdict");
 
 static const unsigned int dw_nf_queue_num = 0;
 static bool dw_queue_handler_registered;
@@ -123,9 +123,9 @@ static bool skb_build_key_ipv4_udp(struct sk_buff *skb, struct dw_pkt_key *key)
 	return true;
 }
 
-static unsigned int dw_nf_prerouting(void *priv,
-				    struct sk_buff *skb,
-				    const struct nf_hook_state *state)
+static unsigned int dw_nf_local_in(void *priv,
+				   struct sk_buff *skb,
+				   const struct nf_hook_state *state)
 {
 	struct dw_pkt_key key;
 	const struct net_device *in_dev = state ? state->in : NULL;
@@ -198,9 +198,9 @@ static unsigned int dw_nf_prerouting(void *priv,
 }
 
 static struct nf_hook_ops nfho = {
-	.hook     = dw_nf_prerouting,
+	.hook     = dw_nf_local_in,
 	.pf       = PF_INET,
-	.hooknum  = NF_INET_PRE_ROUTING,
+	.hooknum  = NF_INET_LOCAL_IN,
 	.priority = NF_IP_PRI_FIRST,
 };
 
