@@ -1,0 +1,1 @@
+savedcmd_/home/ari/in_kernel_nids/phd/xdp/src/c/modules/netfilter_hook.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/ari/in_kernel_nids/phd/xdp/src/c/modules/netfilter_hook.ko /home/ari/in_kernel_nids/phd/xdp/src/c/modules/netfilter_hook.o /home/ari/in_kernel_nids/phd/xdp/src/c/modules/netfilter_hook.mod.o
