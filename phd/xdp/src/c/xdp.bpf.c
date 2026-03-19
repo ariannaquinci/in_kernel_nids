@@ -144,7 +144,6 @@ int xdp_prog(struct xdp_md *ctx)
 	key.udp_len = uh->len;
 	key.proto   = iph->protocol;
 
-	bpf_printk("key: 0x%x, 0x%x,0x%x,0x%x,0x%x, %d, 0x%x", key.saddr, key.daddr, key.sport, key.dport, key.ip_id, key.udp_len, key.proto);
 	__u32 pkt_id = next_pkt_id();
 	if (!pkt_id)
 		return XDP_PASS;

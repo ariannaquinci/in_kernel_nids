@@ -9,8 +9,53 @@ WORKLOAD_OBJ="$OUTPUT_DIR/workload_collector.bpf.o"
 TC_OBJ="$OUTPUT_DIR/tc_ingress.bpf.o"
 
 BPFFS_PATH="/sys/fs/bpf/xdp_nids"
-IFACE="${1:-${XDP_IFACE:-}}"
+IFACE="${XDP_IFACE:-}"
+ENABLE_WORKLOAD_COLLECTOR="${ENABLE_WORKLOAD_COLLECTOR:-1}"
 SHARED_WORKLOAD_MAP="$BPFFS_PATH/maps/workload_state_map"
+
+usage() {
+    cat <<'EOF'
+Usage: ./attach_xdp.sh [IFACE] [--workload on|off]
+
+Environment variables:
+  OUTPUT_DIR=<dir>                 Build output directory (default: .output)
+  XDP_IFACE=<iface>                Default interface if IFACE is omitted
+  ENABLE_WORKLOAD_COLLECTOR=0|1    Enable or disable workload collector (default: 1)
+
+Examples:
+  ./attach_xdp.sh enp1s0
+  ./attach_xdp.sh enp1s0 --workload off
+  ENABLE_WORKLOAD_COLLECTOR=0 ./attach_xdp.sh enp1s0
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workload)
+            [[ $# -ge 2 ]] || { echo "ERRORE: manca valore per --workload"; usage; exit 1; }
+            case "$2" in
+                on) ENABLE_WORKLOAD_COLLECTOR=1 ;;
+                off) ENABLE_WORKLOAD_COLLECTOR=0 ;;
+                *) echo "ERRORE: --workload accetta solo 'on' o 'off'"; usage; exit 1 ;;
+            esac
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            if [[ -z "$IFACE" ]]; then
+                IFACE="$1"
+                shift
+            else
+                echo "ERRORE: argomento inatteso '$1'"
+                usage
+                exit 1
+            fi
+            ;;
+    esac
+done
 
 if [[ -z "$IFACE" ]]; then
     for dev in /sys/class/net/*; do
@@ -24,7 +69,10 @@ fi
 
 # 1. Check file e interfaccia
 [[ ! -f "$XDP_OBJ" ]] && { echo "ERRORE: $XDP_OBJ mancante"; exit 1; }
-[[ ! -f "$WORKLOAD_OBJ" ]] && { echo "ERRORE: $WORKLOAD_OBJ mancante"; exit 1; }
+if [[ "$ENABLE_WORKLOAD_COLLECTOR" == "1" && ! -f "$WORKLOAD_OBJ" ]]; then
+    echo "ERRORE: $WORKLOAD_OBJ mancante"
+    exit 1
+fi
 #[[ ! -f "$TC_OBJ"  ]] && { echo "ERRORE: $TC_OBJ mancante (compila tc_ingress.bpf.c)"; exit 1; }
 
 [[ ! -d "/sys/class/net/$IFACE" ]] && {
@@ -34,7 +82,11 @@ fi
 }
 
 echo "XDP OBJ: $XDP_OBJ"
-echo "Workload collector OBJ: $WORKLOAD_OBJ"
+if [[ "$ENABLE_WORKLOAD_COLLECTOR" == "1" ]]; then
+    echo "Workload collector OBJ: $WORKLOAD_OBJ"
+else
+    echo "Workload collector: disabled"
+fi
 #echo "TC  OBJ: $TC_OBJ"
 echo "IFACE:   $IFACE"
 
@@ -53,15 +105,20 @@ else
     sudo bpftool prog load "$XDP_OBJ" "$PROG_PIN" type xdp
 fi
 
-COLLECTOR_PIN="$BPFFS_PATH/progs/workload_collector"
-echo "Load & auto-attach workload collector..."
-[[ -e "$SHARED_WORKLOAD_MAP" ]] || {
-    echo "FAIL: mappa condivisa non trovata: $SHARED_WORKLOAD_MAP"
-    exit 1
-}
-sudo bpftool prog load "$WORKLOAD_OBJ" "$COLLECTOR_PIN" type tracepoint \
-    map name workload_state_map pinned "$SHARED_WORKLOAD_MAP" \
-    autoattach
+if [[ "$ENABLE_WORKLOAD_COLLECTOR" == "1" ]]; then
+    COLLECTOR_PIN_DIR="$BPFFS_PATH/progs/workload_collector"
+    echo "Load & auto-attach workload collector..."
+    [[ -e "$SHARED_WORKLOAD_MAP" ]] || {
+        echo "FAIL: mappa condivisa non trovata: $SHARED_WORKLOAD_MAP"
+        exit 1
+    }
+    sudo mkdir -p "$COLLECTOR_PIN_DIR"
+    sudo bpftool prog loadall "$WORKLOAD_OBJ" "$COLLECTOR_PIN_DIR" type tracepoint \
+        map name workload_state_map pinned "$SHARED_WORKLOAD_MAP" \
+        autoattach
+else
+    echo "Skip workload collector load (tracking disabled)"
+fi
 
 # 4. ATTACH XDP
 echo "Attach XDP su $IFACE..."
@@ -99,5 +156,3 @@ echo ""
 echo "Logs (kfunc calls):"
 echo "  sudo cat /sys/kernel/debug/tracing/trace_pipe"
 echo ""
-echo "Stats Kernel Module:"
-echo "  cat /sys/kernel/debug/udp_defer/stats"
