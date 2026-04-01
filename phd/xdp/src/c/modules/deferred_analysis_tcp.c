@@ -7,6 +7,7 @@
 #include <linux/jhash.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/errno.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
@@ -29,8 +30,10 @@ MODULE_DESCRIPTION("TCP deferred analysis backend for post-reordering stream chu
 
 struct dw_tcp_flow_state {
 	u64 sock_cookie;
+	struct sock *sk;
 	u32 next_seq;
 	bool next_seq_valid;
+	bool drop_armed;
 	u8 tail_len;
 	u8 tail[DW_TCP_TAIL_LEN];
 	unsigned long last_seen_jiffies;
@@ -81,7 +84,7 @@ static struct dw_tcp_flow_state *dw_tcp_flow_lookup_locked(u64 sock_cookie, u32 
 	return NULL;
 }
 
-static struct dw_tcp_flow_state *dw_tcp_flow_get_locked(u64 sock_cookie, u32 hash)
+static struct dw_tcp_flow_state *dw_tcp_flow_get_locked(struct sock *sk, u64 sock_cookie, u32 hash)
 {
 	struct dw_tcp_flow_state *state;
 
@@ -96,9 +99,36 @@ static struct dw_tcp_flow_state *dw_tcp_flow_get_locked(u64 sock_cookie, u32 has
 		return NULL;
 
 	state->sock_cookie = sock_cookie;
+	state->sk = sk;
 	state->last_seen_jiffies = jiffies;
+	sock_hold(sk);
 	hash_add(dw_tcp_flow_ht, &state->hnode, hash);
 	return state;
+}
+
+static void dw_tcp_apply_drop(struct dw_tcp_flow_state *state)
+{
+	struct sock *sk;
+
+	if (!state)
+		return;
+
+	sk = state->sk;
+	if (!sk)
+		return;
+
+	lock_sock(sk);
+	skb_queue_purge(&sk->sk_receive_queue);
+	WRITE_ONCE(sk->sk_err, ECONNRESET);
+	sk->sk_shutdown |= RCV_SHUTDOWN;
+	release_sock(sk);
+
+	if (sk->sk_error_report)
+		sk->sk_error_report(sk);
+	if (sk->sk_data_ready)
+		sk->sk_data_ready(sk);
+	if (sk->sk_state_change)
+		sk->sk_state_change(sk);
 }
 
 static int dw_tcp_copy_stream_chunk(struct sock *sk, u32 from_seq, u32 to_seq, u8 *dst)
@@ -163,10 +193,21 @@ static unsigned int dw_tcp_hash_to_cpu(u64 sock_cookie)
 static void dw_tcp_analysis_workfn(struct work_struct *work)
 {
 	struct dw_tcp_analysis_work *aw = container_of(work, struct dw_tcp_analysis_work, work);
+	struct dw_tcp_flow_state *state;
 	bool hit;
+	unsigned long flags;
 
 	hit = dw_tcp_buf_contains_needle(aw->data, aw->len);
 	if (hit) {
+		u32 hash = jhash_1word((u32)aw->sock_cookie, (u32)(aw->sock_cookie >> 32));
+
+		spin_lock_irqsave(&dw_tcp_flow_lock, flags);
+		state = dw_tcp_flow_lookup_locked(aw->sock_cookie, hash);
+		if (state)
+			state->drop_armed = true;
+		spin_unlock_irqrestore(&dw_tcp_flow_lock, flags);
+
+		dw_tcp_apply_drop(state);
 		pr_info("tcp deferred chunk cookie=%#llx chunk=%u..%u scan=%u..%u len=%u verdict=DROP_CANDIDATE\n",
 			aw->sock_cookie, aw->from_seq, aw->to_seq,
 			aw->scan_from_seq, aw->scan_to_seq, aw->len);
@@ -201,10 +242,15 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	hash = jhash_1word((u32)sock_cookie, (u32)(sock_cookie >> 32));
 
 	spin_lock_bh(&dw_tcp_flow_lock);
-	state = dw_tcp_flow_get_locked(sock_cookie, hash);
+	state = dw_tcp_flow_get_locked(sk, sock_cookie, hash);
 	if (!state) {
 		spin_unlock_bh(&dw_tcp_flow_lock);
 		return -ENOMEM;
+	}
+
+	if (state->drop_armed) {
+		spin_unlock_bh(&dw_tcp_flow_lock);
+		return -EPERM;
 	}
 
 	if (!state->next_seq_valid) {
@@ -275,6 +321,29 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 }
 EXPORT_SYMBOL_GPL(dw_tcp_enqueue_stream);
 
+bool dw_tcp_is_drop_armed(struct sock *sk)
+{
+	struct dw_tcp_flow_state *state;
+	u64 sock_cookie;
+	u32 hash;
+	bool armed = false;
+
+	if (!sk || sk->sk_protocol != IPPROTO_TCP)
+		return false;
+
+	sock_cookie = (u64)(uintptr_t)sk;
+	hash = jhash_1word((u32)sock_cookie, (u32)(sock_cookie >> 32));
+
+	spin_lock_bh(&dw_tcp_flow_lock);
+	state = dw_tcp_flow_lookup_locked(sock_cookie, hash);
+	if (state)
+		armed = state->drop_armed;
+	spin_unlock_bh(&dw_tcp_flow_lock);
+
+	return armed;
+}
+EXPORT_SYMBOL_GPL(dw_tcp_is_drop_armed);
+
 static int __init deferred_analysis_tcp_init(void)
 {
 	hash_init(dw_tcp_flow_ht);
@@ -301,6 +370,8 @@ static void __exit deferred_analysis_tcp_exit(void)
 	spin_lock_bh(&dw_tcp_flow_lock);
 	hash_for_each_safe(dw_tcp_flow_ht, bkt, tmp, state, hnode) {
 		hash_del(&state->hnode);
+		if (state->sk)
+			sock_put(state->sk);
 		kfree(state);
 	}
 	spin_unlock_bh(&dw_tcp_flow_lock);

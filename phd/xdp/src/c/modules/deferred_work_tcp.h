@@ -5,5 +5,6 @@
 #include <net/sock.h>
 
 int dw_tcp_enqueue_stream(struct sock *sk);
+bool dw_tcp_is_drop_armed(struct sock *sk);
 
 #endif
