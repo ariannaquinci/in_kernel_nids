@@ -167,10 +167,10 @@ build_module_list() {
         done < <(find modules -maxdepth 1 -type f -name '*.ko' -printf '%f\n' | sed 's/\.ko$//' | sort)
     fi
 
-    # Ordine inverso alle dipendenze note del progetto: prima i moduli
-    # netfilter, poi eventuali altri moduli, e deferred_analysis per ultimo.
+    # Reverse known dependency order for this project: protocol hooks first,
+    # auxiliary modules next, and deferred backends last.
     local ordered=()
-    for mod in netfilter_hook udp_nfqueue_gate deferred_analysis; do
+    for mod in tcp_stream_hook netfilter_hook_udp netfilter_hook udp_nfqueue_gate deferred_analysis_tcp deferred_analysis_udp deferred_analysis; do
         if printf '%s\n' "${mods[@]}" | grep -qx "$mod"; then
             ordered+=("$mod")
         fi
