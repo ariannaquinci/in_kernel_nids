@@ -7,6 +7,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-.output}"
 XDP_OBJ="$OUTPUT_DIR/xdp.bpf.o"
 WORKLOAD_OBJ="$OUTPUT_DIR/workload_collector.bpf.o"
 TC_OBJ="$OUTPUT_DIR/tc_ingress.bpf.o"
+MONITOR_MODE="${MONITOR_MODE:-both}"
 
 BPFFS_PATH="/sys/fs/bpf/xdp_nids"
 IFACE="${XDP_IFACE:-}"
@@ -15,16 +16,18 @@ SHARED_WORKLOAD_MAP="$BPFFS_PATH/maps/workload_state_map"
 
 usage() {
     cat <<'EOF'
-Usage: ./attach_xdp.sh [IFACE] [--workload on|off]
+Usage: ./attach_xdp.sh [IFACE] [--workload on|off] [--monitor udp|tcp|both]
 
 Environment variables:
   OUTPUT_DIR=<dir>                 Build output directory (default: .output)
   XDP_IFACE=<iface>                Default interface if IFACE is omitted
   ENABLE_WORKLOAD_COLLECTOR=0|1    Enable or disable workload collector (default: 1)
+  MONITOR_MODE=udp|tcp|both        XDP frontend selection (default: both)
 
 Examples:
   ./attach_xdp.sh enp1s0
   ./attach_xdp.sh enp1s0 --workload off
+  ./attach_xdp.sh enp1s0 --monitor tcp
   ENABLE_WORKLOAD_COLLECTOR=0 ./attach_xdp.sh enp1s0
 EOF
 }
@@ -37,6 +40,14 @@ while [[ $# -gt 0 ]]; do
                 on) ENABLE_WORKLOAD_COLLECTOR=1 ;;
                 off) ENABLE_WORKLOAD_COLLECTOR=0 ;;
                 *) echo "ERRORE: --workload accetta solo 'on' o 'off'"; usage; exit 1 ;;
+            esac
+            shift 2
+            ;;
+        --monitor)
+            [[ $# -ge 2 ]] || { echo "ERROR: missing value for --monitor"; usage; exit 1; }
+            case "$2" in
+                udp|tcp|both) MONITOR_MODE="$2" ;;
+                *) echo "ERROR: --monitor accepts only 'udp', 'tcp', or 'both'"; usage; exit 1 ;;
             esac
             shift 2
             ;;
@@ -57,6 +68,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$MONITOR_MODE" in
+    udp|both)
+        XDP_OBJ="$OUTPUT_DIR/xdp.bpf.o"
+        ;;
+    tcp)
+        XDP_OBJ="$OUTPUT_DIR/xdp_tcp.bpf.o"
+        ;;
+esac
+
 if [[ -z "$IFACE" ]]; then
     for dev in /sys/class/net/*; do
         dev="${dev##*/}"
@@ -67,7 +87,7 @@ if [[ -z "$IFACE" ]]; then
     done
 fi
 
-# 1. Check file e interfaccia
+# 1. Check files and interface
 [[ ! -f "$XDP_OBJ" ]] && { echo "ERRORE: $XDP_OBJ mancante"; exit 1; }
 if [[ "$ENABLE_WORKLOAD_COLLECTOR" == "1" && ! -f "$WORKLOAD_OBJ" ]]; then
     echo "ERRORE: $WORKLOAD_OBJ mancante"
@@ -82,6 +102,7 @@ fi
 }
 
 echo "XDP OBJ: $XDP_OBJ"
+echo "Monitor mode: $MONITOR_MODE"
 if [[ "$ENABLE_WORKLOAD_COLLECTOR" == "1" ]]; then
     echo "Workload collector OBJ: $WORKLOAD_OBJ"
 else
