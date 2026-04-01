@@ -32,7 +32,7 @@ deferred_budget="$(read_json_field deferred_budget)"
 last_update_ns="$(read_json_field last_update_ns)"
 cpu_busy_pct="$(read_json_field cpu_busy_pct)"
 net_rx_softirq_pct="$(read_json_field net_rx_softirq_pct)"
-avg_wakeup_latency_us="$(read_json_field avg_wakeup_latency_us)"
+avg_runqueue_latency_us="$(read_json_field avg_runqueue_latency_us)"
 
 if [[ -z "$workload_level" || -z "$deferred_budget" || -z "$last_update_ns" ]]; then
     echo "output inatteso da bpftool:" >&2
@@ -54,4 +54,4 @@ printf 'deferred_budget: %s\n' "$deferred_budget"
 printf 'last_update_ns: %s\n' "$last_update_ns"
 printf 'cpu_busy_pct: %s\n' "$cpu_busy_pct"
 printf 'net_rx_softirq_pct: %s\n' "$net_rx_softirq_pct"
-printf 'avg_wakeup_latency_us: %s\n' "$avg_wakeup_latency_us"
+printf 'avg_runqueue_latency_us: %s\n' "$avg_runqueue_latency_us"

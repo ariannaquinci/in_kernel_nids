@@ -12,9 +12,9 @@ struct cpu_run_state {
 	__u64 idle_time_ns;
 	__u64 softirq_enter_ns;
 	__u64 net_rx_softirq_time_ns;
-	__u64 wakeup_count;
-	__u64 wakeup_latency_ns;
-	__u64 wakeup_latency_samples;
+	__u64 runnable_count;
+	__u64 runqueue_latency_ns;
+	__u64 runqueue_latency_samples;
 };
 
 struct collector_state {
@@ -22,13 +22,13 @@ struct collector_state {
 	__u64 total_busy_time_ns;
 	__u64 total_idle_time_ns;
 	__u64 total_net_rx_softirq_time_ns;
-	__u64 total_wakeup_latency_ns;
-	__u64 total_wakeup_latency_samples;
+	__u64 total_runqueue_latency_ns;
+	__u64 total_runqueue_latency_samples;
 	__u64 prev_busy_time_ns;
 	__u64 prev_idle_time_ns;
 	__u64 prev_net_rx_softirq_time_ns;
-	__u64 prev_wakeup_latency_ns;
-	__u64 prev_wakeup_latency_samples;
+	__u64 prev_runqueue_latency_ns;
+	__u64 prev_runqueue_latency_samples;
 };
 
 struct {
@@ -52,7 +52,7 @@ struct {
 	__type(value, struct cpu_run_state);
 } cpu_run_state_map SEC(".maps");
 
-struct wakeup_ts {
+struct runnable_ts {
 	__u64 ts_ns;
 };
 
@@ -60,8 +60,8 @@ struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 16384);
 	__type(key, __u32);
-	__type(value, struct wakeup_ts);
-} wakeup_ts_map SEC(".maps");
+	__type(value, struct runnable_ts);
+} runnable_ts_map SEC(".maps");
 
 #define DW_SOFTIRQ_NET_RX 3u
 
@@ -98,8 +98,8 @@ static __always_inline void dw_publish_workload(__u64 now)
 	__u64 window_idle_ns;
 	__u64 window_total_cpu_ns;
 	__u64 window_net_rx_ns;
-	__u64 window_wakeup_latency_ns;
-	__u64 window_wakeup_latency_samples;
+	__u64 window_runqueue_latency_ns;
+	__u64 window_runqueue_latency_samples;
 
 	collector = bpf_map_lookup_elem(&collector_state_map, &collector_key);
 	if (!collector)
@@ -113,44 +113,44 @@ static __always_inline void dw_publish_workload(__u64 now)
 	window_total_cpu_ns = window_busy_ns + window_idle_ns;
 	window_net_rx_ns = collector->total_net_rx_softirq_time_ns -
 		collector->prev_net_rx_softirq_time_ns;
-	window_wakeup_latency_ns = collector->total_wakeup_latency_ns -
-		collector->prev_wakeup_latency_ns;
-	window_wakeup_latency_samples = collector->total_wakeup_latency_samples -
-		collector->prev_wakeup_latency_samples;
+	window_runqueue_latency_ns = collector->total_runqueue_latency_ns -
+		collector->prev_runqueue_latency_ns;
+	window_runqueue_latency_samples = collector->total_runqueue_latency_samples -
+		collector->prev_runqueue_latency_samples;
 
 	if (window_total_cpu_ns) {
 		next.cpu_busy_pct = (__u32)((window_busy_ns * 100ULL) / window_total_cpu_ns);
 		next.net_rx_softirq_pct = (__u32)((window_net_rx_ns * 100ULL) / window_total_cpu_ns);
 	}
 
-	if (window_wakeup_latency_samples) {
-		next.avg_wakeup_latency_us =
-			(__u32)((window_wakeup_latency_ns / window_wakeup_latency_samples) / 1000ULL);
+	if (window_runqueue_latency_samples) {
+		next.avg_runqueue_latency_us =
+			(__u32)((window_runqueue_latency_ns / window_runqueue_latency_samples) / 1000ULL);
 	}
 
 	next.workload_level = dw_workload_level_from_signals(next.cpu_busy_pct,
 							     next.net_rx_softirq_pct,
-							     next.avg_wakeup_latency_us);
+							     next.avg_runqueue_latency_us);
 	next.deferred_budget = dw_budget_for_level(next.workload_level);
 	next.last_update_ns = now;
 
 	collector->prev_busy_time_ns = collector->total_busy_time_ns;
 	collector->prev_idle_time_ns = collector->total_idle_time_ns;
 	collector->prev_net_rx_softirq_time_ns = collector->total_net_rx_softirq_time_ns;
-	collector->prev_wakeup_latency_ns = collector->total_wakeup_latency_ns;
-	collector->prev_wakeup_latency_samples = collector->total_wakeup_latency_samples;
+	collector->prev_runqueue_latency_ns = collector->total_runqueue_latency_ns;
+	collector->prev_runqueue_latency_samples = collector->total_runqueue_latency_samples;
 	collector->last_update_ns = now;
 
 	bpf_map_update_elem(&workload_state_map, &workload_key, &next, BPF_ANY);
 }
 
-static __always_inline int dw_handle_wakeup(__u32 pid)
+static __always_inline int dw_mark_runnable(__u32 pid)
 {
 	__u32 cpu = bpf_get_smp_processor_id();
 	__u32 collector_key = 0;
 	struct cpu_run_state *cpu_state;
 	struct collector_state *collector;
-	struct wakeup_ts wake_ts = {};
+	struct runnable_ts runnable_ts = {};
 	__u64 now;
 
 	if (cpu >= DW_WORKLOAD_MAX_CPUS)
@@ -165,8 +165,8 @@ static __always_inline int dw_handle_wakeup(__u32 pid)
 		return 0;
 
 	now = bpf_ktime_get_ns();
-	wake_ts.ts_ns = now;
-	bpf_map_update_elem(&wakeup_ts_map, &pid, &wake_ts, BPF_ANY);
+	runnable_ts.ts_ns = now;
+	bpf_map_update_elem(&runnable_ts_map, &pid, &runnable_ts, BPF_ANY);
 	dw_publish_workload(now);
 	return 0;
 }
@@ -179,7 +179,8 @@ int workload_collector(struct trace_event_raw_sched_switch *ctx)
 	struct cpu_run_state *cpu_state;
 	struct collector_state *collector;
 	__u64 now;
-	struct wakeup_ts *wake_ts;
+	struct runnable_ts *runnable_ts;
+	__u32 prev_pid;
 	__u32 next_pid;
 
 	if (cpu >= DW_WORKLOAD_MAX_CPUS)
@@ -197,19 +198,30 @@ int workload_collector(struct trace_event_raw_sched_switch *ctx)
 	dw_account_cpu_time(cpu_state, collector, now);
 	cpu_state->is_busy = ctx->next_pid != 0;
 
+	prev_pid = (__u32)ctx->prev_pid;
 	next_pid = (__u32)ctx->next_pid;
-	if (next_pid) {
-		wake_ts = bpf_map_lookup_elem(&wakeup_ts_map, &next_pid);
-		if (wake_ts) {
-			if (now > wake_ts->ts_ns) {
-				__u64 latency = now - wake_ts->ts_ns;
+	/* Skip map churn if the same task stays on CPU across the switch event. */
+	if (prev_pid != next_pid && prev_pid && ctx->prev_state == 0) {
+		struct runnable_ts prev_runnable_ts = {
+			.ts_ns = now,
+		};
 
-				cpu_state->wakeup_latency_ns += latency;
-				cpu_state->wakeup_latency_samples++;
-				__sync_fetch_and_add(&collector->total_wakeup_latency_ns, latency);
-				__sync_fetch_and_add(&collector->total_wakeup_latency_samples, 1);
+		bpf_map_update_elem(&runnable_ts_map, &prev_pid, &prev_runnable_ts, BPF_ANY);
+	}
+
+	if (prev_pid != next_pid && next_pid) {
+		runnable_ts = bpf_map_lookup_elem(&runnable_ts_map, &next_pid);
+		if (runnable_ts) {
+			if (now > runnable_ts->ts_ns) {
+				__u64 latency = now - runnable_ts->ts_ns;
+
+				cpu_state->runqueue_latency_ns += latency;
+				cpu_state->runqueue_latency_samples++;
+				cpu_state->runnable_count++;
+				__sync_fetch_and_add(&collector->total_runqueue_latency_ns, latency);
+				__sync_fetch_and_add(&collector->total_runqueue_latency_samples, 1);
 			}
-			bpf_map_delete_elem(&wakeup_ts_map, &next_pid);
+			bpf_map_delete_elem(&runnable_ts_map, &next_pid);
 		}
 	}
 
@@ -220,13 +232,13 @@ int workload_collector(struct trace_event_raw_sched_switch *ctx)
 SEC("tracepoint/sched/sched_wakeup")
 int workload_wakeup(struct trace_event_raw_sched_wakeup_template *ctx)
 {
-	return dw_handle_wakeup((__u32)ctx->pid);
+	return dw_mark_runnable((__u32)ctx->pid);
 }
 
 SEC("tracepoint/sched/sched_wakeup_new")
 int workload_wakeup_new(struct trace_event_raw_sched_wakeup_template *ctx)
 {
-	return dw_handle_wakeup((__u32)ctx->pid);
+	return dw_mark_runnable((__u32)ctx->pid);
 }
 
 SEC("tracepoint/irq/softirq_entry")
