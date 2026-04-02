@@ -32,7 +32,9 @@ struct dw_tcp_flow_state {
 	u64 sock_cookie;
 	struct sock *sk;
 	u32 next_seq;
+	u32 approved_seq;
 	bool next_seq_valid;
+	bool approved_seq_valid;
 	bool drop_armed;
 	u8 tail_len;
 	u8 tail[DW_TCP_TAIL_LEN];
@@ -68,7 +70,7 @@ static bool dw_tcp_buf_contains_needle(const u8 *buf, size_t len)
 		if (!memcmp(buf + i, DW_TCP_NEEDLE, nlen))
 			return true;
 	}
-
+	//fsleep(3); //simulate expensive analysis
 	return false;
 }
 
@@ -104,31 +106,6 @@ static struct dw_tcp_flow_state *dw_tcp_flow_get_locked(struct sock *sk, u64 soc
 	sock_hold(sk);
 	hash_add(dw_tcp_flow_ht, &state->hnode, hash);
 	return state;
-}
-
-static void dw_tcp_apply_drop(struct dw_tcp_flow_state *state)
-{
-	struct sock *sk;
-
-	if (!state)
-		return;
-
-	sk = state->sk;
-	if (!sk)
-		return;
-
-	lock_sock(sk);
-	skb_queue_purge(&sk->sk_receive_queue);
-	WRITE_ONCE(sk->sk_err, ECONNRESET);
-	sk->sk_shutdown |= RCV_SHUTDOWN;
-	release_sock(sk);
-
-	if (sk->sk_error_report)
-		sk->sk_error_report(sk);
-	if (sk->sk_data_ready)
-		sk->sk_data_ready(sk);
-	if (sk->sk_state_change)
-		sk->sk_state_change(sk);
 }
 
 static int dw_tcp_copy_stream_chunk(struct sock *sk, u32 from_seq, u32 to_seq, u8 *dst)
@@ -194,6 +171,7 @@ static void dw_tcp_analysis_workfn(struct work_struct *work)
 {
 	struct dw_tcp_analysis_work *aw = container_of(work, struct dw_tcp_analysis_work, work);
 	struct dw_tcp_flow_state *state;
+	struct sock *drop_sk = NULL;
 	bool hit;
 	unsigned long flags;
 
@@ -203,14 +181,36 @@ static void dw_tcp_analysis_workfn(struct work_struct *work)
 
 		spin_lock_irqsave(&dw_tcp_flow_lock, flags);
 		state = dw_tcp_flow_lookup_locked(aw->sock_cookie, hash);
-		if (state)
+		if (state) {
 			state->drop_armed = true;
+			drop_sk = state->sk;
+		}
 		spin_unlock_irqrestore(&dw_tcp_flow_lock, flags);
 
-		dw_tcp_apply_drop(state);
+		if (drop_sk) {
+			lock_sock(drop_sk);
+			__skb_queue_purge(&drop_sk->sk_receive_queue);
+			release_sock(drop_sk);
+			tcp_abort(drop_sk, ECONNRESET);
+		}
+
 		pr_info("tcp deferred chunk cookie=%#llx chunk=%u..%u scan=%u..%u len=%u verdict=DROP_CANDIDATE\n",
 			aw->sock_cookie, aw->from_seq, aw->to_seq,
 			aw->scan_from_seq, aw->scan_to_seq, aw->len);
+	} else {
+		u32 hash = jhash_1word((u32)aw->sock_cookie, (u32)(aw->sock_cookie >> 32));
+
+		spin_lock_irqsave(&dw_tcp_flow_lock, flags);
+		state = dw_tcp_flow_lookup_locked(aw->sock_cookie, hash);
+		if (state) {
+			if (!state->approved_seq_valid) {
+				state->approved_seq = aw->from_seq;
+				state->approved_seq_valid = true;
+			}
+			if (state->approved_seq == aw->from_seq)
+				state->approved_seq = aw->to_seq;
+		}
+		spin_unlock_irqrestore(&dw_tcp_flow_lock, flags);
 	}
 
 	kfree(aw);
@@ -256,6 +256,8 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	if (!state->next_seq_valid) {
 		state->next_seq = READ_ONCE(tp->copied_seq);
 		state->next_seq_valid = true;
+		state->approved_seq = state->next_seq;
+		state->approved_seq_valid = true;
 	}
 
 	prefix_len = state->tail_len;
@@ -343,6 +345,43 @@ bool dw_tcp_is_drop_armed(struct sock *sk)
 	return armed;
 }
 EXPORT_SYMBOL_GPL(dw_tcp_is_drop_armed);
+
+size_t dw_tcp_approved_len(struct sock *sk, size_t requested_len)
+{
+	struct dw_tcp_flow_state *state;
+	u64 sock_cookie;
+	u32 hash;
+	u32 copied_seq;
+	u32 approved_seq;
+	size_t allowed = requested_len;
+
+	if (!sk || sk->sk_protocol != IPPROTO_TCP)
+		return requested_len;
+
+	sock_cookie = (u64)(uintptr_t)sk;
+	hash = jhash_1word((u32)sock_cookie, (u32)(sock_cookie >> 32));
+	copied_seq = READ_ONCE(tcp_sk(sk)->copied_seq);
+
+	spin_lock_bh(&dw_tcp_flow_lock);
+	state = dw_tcp_flow_lookup_locked(sock_cookie, hash);
+	if (!state || !state->approved_seq_valid || state->drop_armed) {
+		allowed = 0;
+		goto out;
+	}
+
+	approved_seq = state->approved_seq;
+	if (!before(copied_seq, approved_seq)) {
+		allowed = 0;
+		goto out;
+	}
+
+	allowed = min_t(size_t, requested_len, (size_t)(approved_seq - copied_seq));
+
+out:
+	spin_unlock_bh(&dw_tcp_flow_lock);
+	return allowed;
+}
+EXPORT_SYMBOL_GPL(dw_tcp_approved_len);
 
 static int __init deferred_analysis_tcp_init(void)
 {

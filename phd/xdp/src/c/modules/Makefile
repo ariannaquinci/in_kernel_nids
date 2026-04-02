@@ -32,6 +32,8 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
 load:
+	insmod deferred_analysis_tcp.ko
+	insmod tcp_stream_hook.ko
 	insmod deferred_analysis_udp.ko
 	insmod netfilter_hook_udp.ko
 
