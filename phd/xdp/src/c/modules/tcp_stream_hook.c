@@ -7,6 +7,7 @@
 #include <linux/ptrace.h>
 
 #include <net/sock.h>
+#include <net/tcp.h>
 
 #include "deferred_work_tcp.h"
 #include "dw_policy.h"
@@ -22,6 +23,27 @@ struct dw_tcp_probe_ctx {
 
 struct dw_tcp_recv_probe_ctx {
 	struct sock *sk;
+};
+
+static int dw_tcp_recvmsg_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct sock *sk = (struct sock *)regs->di;
+	size_t req_len = (size_t)regs->dx;
+	size_t allowed;
+
+	if (!sk)
+		return 0;
+
+	allowed = dw_tcp_approved_len(sk, req_len);
+	if (allowed > 0 && allowed < req_len)
+		regs->dx = allowed;
+
+	return 0;
+}
+
+static struct kprobe dw_tcp_recvmsg_probe = {
+	.symbol_name = "tcp_recvmsg",
+	.pre_handler = dw_tcp_recvmsg_pre,
 };
 
 static int dw_tcp_data_queue_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -55,37 +77,6 @@ static struct kretprobe dw_tcp_data_queue_probe = {
 	.maxactive = 64,
 };
 
-static int dw_tcp_recvmsg_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct dw_tcp_recv_probe_ctx *ctx = (struct dw_tcp_recv_probe_ctx *)ri->data;
-
-	ctx->sk = (struct sock *)regs->di;
-	return 0;
-}
-
-static int dw_tcp_recvmsg_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct dw_tcp_recv_probe_ctx *ctx = (struct dw_tcp_recv_probe_ctx *)ri->data;
-
-	if (!ctx->sk)
-		return 0;
-
-	if (!dw_tcp_is_drop_armed(ctx->sk))
-		return 0;
-
-	regs_set_return_value(regs, -ECONNRESET);
-	pr_info("tcp recvmsg blocked sk=%p verdict=DROP\n", ctx->sk);
-	return 0;
-}
-
-static struct kretprobe dw_tcp_recvmsg_probe = {
-	.kp.symbol_name = "tcp_recvmsg",
-	.entry_handler = dw_tcp_recvmsg_entry,
-	.handler = dw_tcp_recvmsg_ret,
-	.data_size = sizeof(struct dw_tcp_recv_probe_ctx),
-	.maxactive = 64,
-};
-
 static int __init tcp_stream_hook_init(void)
 {
 	int ret;
@@ -96,20 +87,20 @@ static int __init tcp_stream_hook_init(void)
 		return ret;
 	}
 
-	ret = register_kretprobe(&dw_tcp_recvmsg_probe);
+	ret = register_kprobe(&dw_tcp_recvmsg_probe);
 	if (ret) {
 		unregister_kretprobe(&dw_tcp_data_queue_probe);
-		pr_err("register_kretprobe(tcp_recvmsg) failed: %d\n", ret);
+		pr_err("register_kprobe(tcp_recvmsg) failed: %d\n", ret);
 		return ret;
 	}
 
-	pr_info("loaded kretprobes on tcp_data_queue and tcp_recvmsg, TCP gate active\n");
+	pr_info("loaded kretprobe tcp_data_queue + kprobe tcp_recvmsg (len clamp)\n");
 	return 0;
 }
 
 static void __exit tcp_stream_hook_exit(void)
 {
-	unregister_kretprobe(&dw_tcp_recvmsg_probe);
+	unregister_kprobe(&dw_tcp_recvmsg_probe);
 	unregister_kretprobe(&dw_tcp_data_queue_probe);
 	pr_info("unloaded\n");
 }
