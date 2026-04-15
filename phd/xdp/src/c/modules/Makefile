@@ -54,3 +54,8 @@ unload:
 		echo "missing teardown script: $(TEARDOWN)" >&2; \
 		exit 1; \
 	fi
+	rmmod tcp_stream_hook
+	rmmod deferred_analysis_tcp
+	rmmod netfilter_hook_udp
+	rmmod deferred_analysis_udp
+	

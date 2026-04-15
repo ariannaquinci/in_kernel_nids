@@ -33,12 +33,13 @@ MODULE_DESCRIPTION("UDP deferred analysis path separated from the future TCP str
 
 struct pkt_state {
 	u32 pkt_id;
-	u32 req_mask;
+	atomic_t req_mask;
 	atomic_t done_mask;
 	atomic_t hit_mask;  /* bitmask di analisi con match malevolo */
 	atomic_t verdict; /* 0 unknown, 1 pass, 2 drop */
 	unsigned long last_seen_jiffies;
 	struct hlist_node hnode;
+	struct rcu_head rcu;
 };
 
 #define STATE_BITS 12
@@ -67,6 +68,7 @@ struct pkt_snap_ent {
 	u32 cap_len;
 	unsigned long ts_jiffies;
 	struct hlist_node hnode;
+	struct rcu_head rcu;
 	u8 data[];
 };
 
@@ -127,7 +129,7 @@ struct dw_vlan_hdr {
 	__be16 enc_proto;
 } __packed;
 
-static struct pkt_state *state_lookup(u32 pkt_id)
+static struct pkt_state *state_lookup_locked(u32 pkt_id)
 {
 	struct pkt_state *st;
 	hash_for_each_possible(state_ht, st, hnode, pkt_id) {
@@ -137,30 +139,53 @@ static struct pkt_state *state_lookup(u32 pkt_id)
 	return NULL;
 }
 
-static struct pkt_state *state_get_or_create(u32 pkt_id, u32 req_mask)
+static struct pkt_state *state_lookup_rcu(u32 pkt_id)
 {
 	struct pkt_state *st;
 
-	st = state_lookup(pkt_id);
-	if (st) {
-		st->req_mask |= (req_mask & DW_REQ_MASK_3);
-		st->last_seen_jiffies = jiffies;
-		return st;
+	hash_for_each_possible_rcu(state_ht, st, hnode, pkt_id) {
+		if (READ_ONCE(st->pkt_id) == pkt_id)
+			return st;
 	}
+
+	return NULL;
+}
+
+static struct pkt_state *state_create_locked(u32 pkt_id, u32 req_mask)
+{
+	struct pkt_state *st;
 
 	st = kzalloc(sizeof(*st), GFP_ATOMIC);
 	if (!st)
 		return NULL;
 
 	st->pkt_id = pkt_id;
-	st->req_mask = req_mask & DW_REQ_MASK_3;
+	atomic_set(&st->req_mask, req_mask & DW_REQ_MASK_3);
 	atomic_set(&st->done_mask, 0);
 	atomic_set(&st->hit_mask, 0);
 	atomic_set(&st->verdict, DW_VERDICT_UNKNOWN);
 	st->last_seen_jiffies = jiffies;
 
-	hash_add(state_ht, &st->hnode, pkt_id);
+	hash_add_rcu(state_ht, &st->hnode, pkt_id);
 	return st;
+}
+
+static void pkt_state_try_set_pass(struct pkt_state *st)
+{
+	atomic_cmpxchg(&st->verdict, DW_VERDICT_UNKNOWN, DW_VERDICT_PASS);
+}
+
+static void pkt_state_set_drop(struct pkt_state *st)
+{
+	int verdict;
+
+	for (;;) {
+		verdict = atomic_read(&st->verdict);
+		if (verdict == DW_VERDICT_DROP)
+			return;
+		if (atomic_cmpxchg(&st->verdict, verdict, DW_VERDICT_DROP) == verdict)
+			return;
+	}
 }
 
 static bool buf_contains_needle(const u8 *buf, size_t len, const char *needle)
@@ -189,6 +214,18 @@ static struct pkt_snap_ent *snap_lookup_locked(u32 pkt_id)
 	return NULL;
 }
 
+static struct pkt_snap_ent *snap_lookup_rcu(u32 pkt_id)
+{
+	struct pkt_snap_ent *e;
+
+	hash_for_each_possible_rcu(snap_ht, e, hnode, pkt_id) {
+		if (READ_ONCE(e->pkt_id) == pkt_id)
+			return e;
+	}
+
+	return NULL;
+}
+
 static void snap_drop(u32 pkt_id)
 {
 	struct pkt_snap_ent *e;
@@ -196,10 +233,11 @@ static void snap_drop(u32 pkt_id)
 	spin_lock_bh(&snap_lock);
 	e = snap_lookup_locked(pkt_id);
 	if (e)
-		hash_del(&e->hnode);
+		hash_del_rcu(&e->hnode);
 	spin_unlock_bh(&snap_lock);
 
-	kfree(e);
+	if (e)
+		kfree_rcu(e, rcu);
 }
 
 static bool frame_udp_payload_contains(const u8 *frame, u32 frame_len, const char *needle)
@@ -271,17 +309,15 @@ static int snapshot_pkt_payload_contains(u32 pkt_id, const char *needle, bool *f
 	if (!found_out)
 		return -EINVAL;
 
-	spin_lock_bh(&snap_lock);
-	e = snap_lookup_locked(pkt_id);
-	if (e)
-		hash_del(&e->hnode);
-	spin_unlock_bh(&snap_lock);
-
-	if (!e)
+	rcu_read_lock();
+	e = snap_lookup_rcu(pkt_id);
+	if (!e) {
+		rcu_read_unlock();
 		return -ENOENT;
+	}
 
 	found = frame_udp_payload_contains(e->data, e->cap_len, needle);
-	kfree(e);
+	rcu_read_unlock();
 
 	*found_out = found;
 	return 0;
@@ -292,11 +328,11 @@ u32 dw_get_done_mask(u32 pkt_id)
 	struct pkt_state *st;
 	u32 v = 0;
 
-	spin_lock_bh(&state_lock);
-	st = state_lookup(pkt_id);
+	rcu_read_lock();
+	st = state_lookup_rcu(pkt_id);
 	if (st)
 		v = (u32)atomic_read(&st->done_mask);
-	spin_unlock_bh(&state_lock);
+	rcu_read_unlock();
 
 	return v;
 }
@@ -307,11 +343,11 @@ int dw_get_verdict(u32 pkt_id)
 	struct pkt_state *st;
 	int v = DW_VERDICT_UNKNOWN;
 
-	spin_lock_bh(&state_lock);
-	st = state_lookup(pkt_id);
+	rcu_read_lock();
+	st = state_lookup_rcu(pkt_id);
 	if (st)
 		v = atomic_read(&st->verdict);
-	spin_unlock_bh(&state_lock);
+	rcu_read_unlock();
 
 	return v;
 }
@@ -320,27 +356,28 @@ EXPORT_SYMBOL_GPL(dw_get_verdict);
 void dw_note_payload_signature(u32 pkt_id, u32 req_mask, bool is_malicious)
 {
 	struct pkt_state *st;
-	u32 req, done, hits;
+	u32 req, done, hits, tracked_req;
 
 	req = req_mask & DW_REQ_MASK_3;
 	if (!pkt_id || !req || !is_malicious)
 		return;
 
-	spin_lock_bh(&state_lock);
-	st = state_lookup(pkt_id);
+	rcu_read_lock();
+	st = state_lookup_rcu(pkt_id);
 	if (st) {
 		/* Dummy behavior: any requested analysis may report the payload marker. */
 		atomic_or(req & DW_REQ_MASK_3, &st->hit_mask);
 		hits = (u32)atomic_read(&st->hit_mask);
 		done = (u32)atomic_read(&st->done_mask);
-		if (hits & (st->req_mask & DW_REQ_MASK_3))
-			atomic_set(&st->verdict, DW_VERDICT_DROP);
-		st->last_seen_jiffies = jiffies;
+		tracked_req = (u32)atomic_read(&st->req_mask) & DW_REQ_MASK_3;
+		if (hits & tracked_req)
+			pkt_state_set_drop(st);
+		WRITE_ONCE(st->last_seen_jiffies, jiffies);
 
 		pr_info("payload marker hit pkt_id=%u req=0x%x needle=\"%s\" done=0x%x hits=0x%x -> verdict=DROP\n",
 			pkt_id, req, DW_DUMMY_NEEDLE, done, hits);
 	}
-	spin_unlock_bh(&state_lock);
+	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(dw_note_payload_signature);
 
@@ -499,11 +536,12 @@ static __bpf_kfunc int dw_pkt_snapshot_put(const u8 *data, u32 len, u32 pkt_id)
 	spin_lock_bh(&snap_lock);
 	old = snap_lookup_locked(pkt_id);
 	if (old)
-		hash_del(&old->hnode);
-	hash_add(snap_ht, &e->hnode, pkt_id);
+		hash_del_rcu(&old->hnode);
+	hash_add_rcu(snap_ht, &e->hnode, pkt_id);
 	spin_unlock_bh(&snap_lock);
 
-	kfree(old);
+	if (old)
+		kfree_rcu(old, rcu);
 
 	if (len > cap_len)
 		pr_info("snapshot pkt_id=%u truncated frame_len=%u cap_len=%u\n",
@@ -543,6 +581,7 @@ EXPORT_SYMBOL_GPL(dw_meta_get_and_del);
 
 struct analysis_work {
 	struct work_struct work;
+	struct pkt_state *st;
 	u32 pkt_id;
 	u32 bit;
 };
@@ -671,7 +710,7 @@ static void dw_try_deliver_ready(void)
 static void analysis_workfn(struct work_struct *w)
 {
 	struct analysis_work *aw = container_of(w, struct analysis_work, work);
-	struct pkt_state *st;
+	struct pkt_state *st = aw->st;
 	u32 req_mask, done, hits;
 	bool is_malicious = false;
 	bool terminal = false;
@@ -693,15 +732,11 @@ static void analysis_workfn(struct work_struct *w)
 		if (sig_rc < 0)
 			pr_info("analysis pkt_id=%u bit=0x%x snapshot not available rc=%d, continuing\n",
 				aw->pkt_id, aw->bit, sig_rc);
-		if (!sig_rc)
-			dw_note_payload_signature(aw->pkt_id, aw->bit, is_malicious);
 		break;
 	default:
 		break;
 	}
 
-	spin_lock_bh(&state_lock);
-	st = state_lookup(aw->pkt_id);
 	if (st) {
 		if (is_malicious)
 			atomic_or(aw->bit, &st->hit_mask);
@@ -709,16 +744,15 @@ static void analysis_workfn(struct work_struct *w)
 		atomic_or(aw->bit, &st->done_mask);
 		done = (u32)atomic_read(&st->done_mask);
 		hits = (u32)atomic_read(&st->hit_mask);
-		req_mask = st->req_mask & DW_REQ_MASK_3;
+		req_mask = (u32)atomic_read(&st->req_mask) & DW_REQ_MASK_3;
 
 		if (hits & req_mask)
-			atomic_set(&st->verdict, DW_VERDICT_DROP);
+			pkt_state_set_drop(st);
 		else if ((done & req_mask) == req_mask)
-			atomic_set(&st->verdict, DW_VERDICT_PASS);
+			pkt_state_try_set_pass(st);
 
-		st->last_seen_jiffies = jiffies;
+		WRITE_ONCE(st->last_seen_jiffies, jiffies);
 	}
-	spin_unlock_bh(&state_lock);
 
 	if (st) {
 		pr_info("analysis pkt_id=%u bit=0x%x done=0x%x/0x%x hits=0x%x verdict=%s\n",
@@ -748,9 +782,25 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 	if (!req_mask)
 		return 0;
 
-	spin_lock_bh(&state_lock);
-	st = state_get_or_create(pkt_id, req_mask);
-	spin_unlock_bh(&state_lock);
+	rcu_read_lock();
+	st = state_lookup_rcu(pkt_id);
+	if (st) {
+		atomic_or(req_mask & DW_REQ_MASK_3, &st->req_mask);
+		WRITE_ONCE(st->last_seen_jiffies, jiffies);
+	}
+	rcu_read_unlock();
+
+	if (!st) {
+		spin_lock_bh(&state_lock);
+		st = state_lookup_locked(pkt_id);
+		if (st) {
+			atomic_or(req_mask & DW_REQ_MASK_3, &st->req_mask);
+			WRITE_ONCE(st->last_seen_jiffies, jiffies);
+		} else {
+			st = state_create_locked(pkt_id, req_mask);
+		}
+		spin_unlock_bh(&state_lock);
+	}
 
 	if (!st) {
 		atomic_inc(&st_dropped);
@@ -772,6 +822,7 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 			continue;
 		}
 		INIT_WORK(&aw->work, analysis_workfn);
+		aw->st = st;
 		aw->pkt_id = pkt_id;
 		aw->bit = bit;
 
@@ -980,8 +1031,8 @@ static void __exit deferred_exit(void)
 	/* cleanup state_ht */
 	spin_lock_bh(&state_lock);
 	hash_for_each_safe(state_ht, bkt, tmp, st, hnode) {
-		hash_del(&st->hnode);
-		kfree(st);
+		hash_del_rcu(&st->hnode);
+		kfree_rcu(st, rcu);
 	}
 	spin_unlock_bh(&state_lock);
 
@@ -1009,8 +1060,8 @@ static void __exit deferred_exit(void)
 	/* cleanup snap_ht (XDP frame snapshots) */
 	spin_lock_bh(&snap_lock);
 	hash_for_each_safe(snap_ht, bkt, tmp, se, hnode) {
-		hash_del(&se->hnode);
-		kfree(se);
+		hash_del_rcu(&se->hnode);
+		kfree_rcu(se, rcu);
 	}
 	spin_unlock_bh(&snap_lock);
 
