@@ -1,3 +1,6 @@
+#ifndef __ALGO_AC_H__
+#define __ALGO_AC_H__
+
 #define ALPHABET_SIZE 256
 typedef struct DFA_node{
 	struct DFA_node *link[ALPHABET_SIZE];	
@@ -16,3 +19,5 @@ int DFA_exec(DFA_node*, const unsigned char*,int **);
 void DFA_debug(DFA_node*);
 DFA_node * DFA_build(const void **dictionary,int size); //la size è opzionale maybe
 void DFA_free(DFA_node *);
+
+#endif
