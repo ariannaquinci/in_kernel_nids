@@ -1,12 +1,15 @@
 #include "algo-ac.h"
-#include <string.h>
 #ifdef __KERNEL__
 #define STAMPA printk
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/sort.h>
 #define REQUEST_MM(x) kmalloc(x,GFP_KERNEL)
 #define REALLOC_MM(x,y) krealloc(x,y,GFP_KERNEL)
 #define FREE_MM(x) kfree(x)
+#define SORT_MM(base, num, size, cmp) sort((base), (num), (size), (cmp), NULL)
 #else
+#include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -14,9 +17,10 @@
 #define REQUEST_MM(x) malloc(x)
 #define REALLOC_MM(x,y) realloc(x,y)
 #define FREE_MM(x) free(x)
+#define SORT_MM(base, num, size, cmp) qsort((base), (num), (size), (cmp))
 #endif
 volatile int state_id=0;
-DFA_node * create_dfa_node(){
+static DFA_node *create_dfa_node(void){
 	DFA_node *new_node = (DFA_node*) REQUEST_MM(sizeof(DFA_node));
 	if (new_node ==NULL){
 		STAMPA("errore critico\n");
@@ -33,20 +37,20 @@ DFA_node * create_dfa_node(){
     	}	
     	return new_node;
 }
-void DFA_insert(DFA_node *root,const unsigned char * word,int index){
-	DFA_node *current = root;
+static void DFA_insert(DFA_node *root,const unsigned char * word,int index){
+	DFA_node *node = root;
 	for (int i = 0; word[i] != '\0'; i++)
 	{
-		if (current->link[word[i]] == NULL)
+		if (node->link[word[i]] == NULL)
 		{
-	    		current->link[word[i]] = create_dfa_node();
+	    		node->link[word[i]] = create_dfa_node();
 		}
-		current = current->link[word[i]];
+		node = node->link[word[i]];
 	}
-	current->end_of_word = 1;
-	current->index = index;
+	node->end_of_word = 1;
+	node->index = index;
 }
-void DFA_create_failure_link(DFA_node * root){
+static void DFA_create_failure_link(DFA_node * root){
     int queue_capacity = 10; // Initial queue capacity
     int queue_size = 0;
     DFA_node **queue = (DFA_node **)REQUEST_MM(queue_capacity * sizeof(DFA_node *));
@@ -55,17 +59,17 @@ void DFA_create_failure_link(DFA_node * root){
     queue_size++;
     while (front < rear)
     {
-        DFA_node *current = queue[front++];
+        DFA_node *node = queue[front++];
         for (int i = 0; i < ALPHABET_SIZE; i++)
         {
-            DFA_node *child = current->link[i];
-            if (child && current == root)
+            DFA_node *child = node->link[i];
+            if (child && node == root)
             {
                 child->failure = root;
             }
             else if (child)
             {
-                DFA_node *failure = current->failure;
+                DFA_node *failure = node->failure;
                 while (failure && !failure->link[i])
                 {
                     failure = failure->failure;
@@ -84,7 +88,7 @@ void DFA_create_failure_link(DFA_node * root){
             }
         }
     }
-    free(queue);
+    FREE_MM(queue);
 }
 
 DFA_node * DFA_build(const void **dictionary,int size)
@@ -101,40 +105,40 @@ DFA_node * DFA_build(const void **dictionary,int size)
 	return root;
 }
 
-void DFA_free(DFA_node *current){
-	if (current == NULL) return;
+void DFA_free(DFA_node *node){
+	if (node == NULL) return;
     	for (int i = 0; i < ALPHABET_SIZE ; i++)
     	{
-    		if (current->link[i] != NULL) DFA_free(current->link[i]);
+    		if (node->link[i] != NULL) DFA_free(node->link[i]);
     	}
-   	free(current);
+   	FREE_MM(node);
 }
 int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices){
 
-    DFA_node *current = root;
+    DFA_node *node = root;
     int len = strlen((char *)byte);
     int matchIndicesCapacity = 100; // Initial capacity
     int numMatches = 0;
-    *matchIndices = (int *) malloc(matchIndicesCapacity * sizeof(int));
+    *matchIndices = (int *) REQUEST_MM(matchIndicesCapacity * sizeof(int));
     if(*matchIndices == NULL) return 0;
     for (int i = 0; i < len; i++)
     {
-	while (current && !current->link[byte[i]])
+	while (node && !node->link[byte[i]])
       	{
-            current = current->failure;
+            node = node->failure;
         }
         
-	current = current ? current->link[byte[i]] : root;
+	node = node ? node->link[byte[i]] : root;
         
 	// **Incremento qui**
-	if (current) __sync_fetch_and_add(&(current->visit_c),1);
-	DFA_node *temp = current;
+	if (node) __sync_fetch_and_add(&(node->visit_c),1);
+	DFA_node *temp = node;
         while (temp && temp->end_of_word)
         {
 	    if (numMatches == matchIndicesCapacity)
             {
                 matchIndicesCapacity *= 2;
-                *matchIndices = (int *) realloc(*matchIndices, matchIndicesCapacity * sizeof(int));
+                *matchIndices = (int *) REALLOC_MM(*matchIndices, matchIndicesCapacity * sizeof(int));
             }
             (*matchIndices)[numMatches++] = temp->index;
 	    temp = temp->failure;
@@ -143,7 +147,7 @@ int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices){
     return numMatches;
 }
 
-void collect_states(DFA_node *node, DFA_node **array, int *count, int max_count) {
+static void collect_states(DFA_node *node, DFA_node **array, int *count, int max_count) {
     if (!node) return;
     // verifica se abbiamo già superato la capacità
     if (*count >= max_count) return;
@@ -158,7 +162,7 @@ void collect_states(DFA_node *node, DFA_node **array, int *count, int max_count)
 }
 
 // Comparator per qsort
-int compare_nodes(const void *a, const void *b) {
+static int compare_nodes(const void *a, const void *b) {
     DFA_node *na = *(DFA_node **)a;
     DFA_node *nb = *(DFA_node **)b;
     return na->visit_c - nb->visit_c;
@@ -169,7 +173,7 @@ void DFA_debug(DFA_node *root) {
     if (!root) return;
     // massimo numero di stati stimato (puoi aumentare se necessario)
     int max_states = 10000;
-    DFA_node **nodes = (DFA_node **)malloc(sizeof(DFA_node *) * max_states);
+    DFA_node **nodes = (DFA_node **)REQUEST_MM(sizeof(DFA_node *) * max_states);
     int count = 0;
 
     collect_states(root, nodes, &count, max_states);
@@ -177,7 +181,7 @@ void DFA_debug(DFA_node *root) {
     STAMPA("Numero totale stati: %d\n", count);
 
     // ordina per index
-    qsort(nodes, count, sizeof(DFA_node *), compare_nodes);
+    SORT_MM(nodes, count, sizeof(DFA_node *), compare_nodes);
 
     int visite_totali=0;
     for (int i = 0; i < count; i++) {
@@ -188,4 +192,3 @@ void DFA_debug(DFA_node *root) {
     STAMPA("visite_totali %d\n",visite_totali);
     FREE_MM(nodes);
 }
-

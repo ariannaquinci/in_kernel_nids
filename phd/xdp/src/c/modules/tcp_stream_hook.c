@@ -5,6 +5,7 @@
 #include <linux/init.h>
 #include <linux/kprobes.h>
 #include <linux/ptrace.h>
+#include <asm/ptrace.h>
 
 #include <net/sock.h>
 #include <net/tcp.h>
@@ -34,6 +35,11 @@ static int dw_tcp_recvmsg_pre(struct kprobe *p, struct pt_regs *regs)
 	if (!sk)
 		return 0;
 
+	if (dw_tcp_is_drop_armed(sk)) {
+		tcp_abort(sk, ECONNRESET);
+		return 0;
+	}
+
 	allowed = dw_tcp_approved_len(sk, req_len);
 	if (allowed > 0 && allowed < req_len)
 		regs->dx = allowed;
@@ -44,6 +50,34 @@ static int dw_tcp_recvmsg_pre(struct kprobe *p, struct pt_regs *regs)
 static struct kprobe dw_tcp_recvmsg_probe = {
 	.symbol_name = "tcp_recvmsg",
 	.pre_handler = dw_tcp_recvmsg_pre,
+};
+
+static int dw_tcp_recvmsg_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct dw_tcp_recv_probe_ctx *ctx = (struct dw_tcp_recv_probe_ctx *)ri->data;
+
+	ctx->sk = (struct sock *)regs->di;
+	return 0;
+}
+
+static int dw_tcp_recvmsg_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct dw_tcp_recv_probe_ctx *ctx = (struct dw_tcp_recv_probe_ctx *)ri->data;
+
+	if (!ctx->sk || !dw_tcp_is_drop_armed(ctx->sk))
+		return 0;
+
+	tcp_abort(ctx->sk, ECONNRESET);
+	regs_set_return_value(regs, (unsigned long)-ECONNRESET);
+	return 0;
+}
+
+static struct kretprobe dw_tcp_recvmsg_ret_probe = {
+	.kp.symbol_name = "tcp_recvmsg",
+	.entry_handler = dw_tcp_recvmsg_entry,
+	.handler = dw_tcp_recvmsg_ret,
+	.data_size = sizeof(struct dw_tcp_recv_probe_ctx),
+	.maxactive = 64,
 };
 
 static int dw_tcp_data_queue_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -94,12 +128,21 @@ static int __init tcp_stream_hook_init(void)
 		return ret;
 	}
 
-	pr_info("loaded kretprobe tcp_data_queue + kprobe tcp_recvmsg (len clamp)\n");
+	ret = register_kretprobe(&dw_tcp_recvmsg_ret_probe);
+	if (ret) {
+		unregister_kprobe(&dw_tcp_recvmsg_probe);
+		unregister_kretprobe(&dw_tcp_data_queue_probe);
+		pr_err("register_kretprobe(tcp_recvmsg) failed: %d\n", ret);
+		return ret;
+	}
+
+	pr_info("loaded kretprobe tcp_data_queue + kprobe/kretprobe tcp_recvmsg\n");
 	return 0;
 }
 
 static void __exit tcp_stream_hook_exit(void)
 {
+	unregister_kretprobe(&dw_tcp_recvmsg_ret_probe);
 	unregister_kprobe(&dw_tcp_recvmsg_probe);
 	unregister_kretprobe(&dw_tcp_data_queue_probe);
 	pr_info("unloaded\n");

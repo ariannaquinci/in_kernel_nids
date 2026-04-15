@@ -23,6 +23,9 @@
 
 #include <net/ip.h>
 
+#include "../algolib/algo-ac.h"
+#include "../algolib/algo-ac.c"
+#include "dw_ac_patterns_autogen.h"
 #include "deferred_work.h"
 
 MODULE_LICENSE("GPL");
@@ -121,6 +124,48 @@ static atomic_t nfq_quiescing    = ATOMIC_INIT(0);
 static atomic_t dw_stopping      = ATOMIC_INIT(0);
 
 #define DW_DUMMY_NEEDLE "malicious"
+#define DW_DUMMY_NEEDLE_LEN (sizeof(DW_DUMMY_NEEDLE) - 1)
+
+static DFA_node *dw_ac_root;
+
+static bool dw_bytes_contains(const u8 *buf, size_t len,
+			      const u8 *needle, size_t needle_len)
+{
+	size_t i;
+
+	if (!buf || !needle || !needle_len || len < needle_len)
+		return false;
+
+	for (i = 0; i <= len - needle_len; i++) {
+		if (!memcmp(buf + i, needle, needle_len))
+			return true;
+	}
+
+	return false;
+}
+
+static bool dw_ac_match_bytes(DFA_node *root, const u8 *buf, size_t len)
+{
+	unsigned char *tmp;
+	int *match_indices = NULL;
+	int matches;
+
+	if (!root || !buf || !len)
+		return false;
+
+	tmp = kmalloc(len + 1, GFP_KERNEL);
+	if (!tmp)
+		return false;
+
+	memcpy(tmp, buf, len);
+	tmp[len] = '\0';
+
+	matches = DFA_exec(root, tmp, &match_indices);
+	kfree(match_indices);
+	kfree(tmp);
+
+	return matches > 0;
+}
 
 /* -------- helpers -------- */
 
@@ -186,21 +231,6 @@ static void pkt_state_set_drop(struct pkt_state *st)
 		if (atomic_cmpxchg(&st->verdict, verdict, DW_VERDICT_DROP) == verdict)
 			return;
 	}
-}
-
-static bool buf_contains_needle(const u8 *buf, size_t len, const char *needle)
-{
-	size_t i, nlen = strlen(needle);
-
-	if (!buf || !needle || !nlen || len < nlen)
-		return false;
-
-	for (i = 0; i + nlen <= len; i++) {
-		if (!memcmp(buf + i, needle, nlen))
-			return true;
-	}
-
-	return false;
 }
 
 static struct pkt_snap_ent *snap_lookup_locked(u32 pkt_id)
@@ -298,7 +328,18 @@ static bool frame_udp_payload_contains(const u8 *frame, u32 frame_len, const cha
 	if (!payload_len)
 		return false;
 
-	return buf_contains_needle(frame + payload_off, payload_len, needle);
+	if (!strcmp(needle, DW_DUMMY_NEEDLE))
+		return dw_bytes_contains(frame + payload_off, payload_len,
+					 (const u8 *)DW_DUMMY_NEEDLE,
+					 DW_DUMMY_NEEDLE_LEN);
+
+	if (payload_len < DW_AC_MIN_LEN)
+		return false;
+
+	if (strcmp(needle, DW_AC_PATTERN_LABEL))
+		return false;
+
+	return dw_ac_match_bytes(dw_ac_root, frame + payload_off, payload_len);
 }
 
 static int snapshot_pkt_payload_contains(u32 pkt_id, const char *needle, bool *found_out)
@@ -365,7 +406,7 @@ void dw_note_payload_signature(u32 pkt_id, u32 req_mask, bool is_malicious)
 	rcu_read_lock();
 	st = state_lookup_rcu(pkt_id);
 	if (st) {
-		/* Dummy behavior: any requested analysis may report the payload marker. */
+		/* Any requested analysis may report a match against the shared AC signature set. */
 		atomic_or(req & DW_REQ_MASK_3, &st->hit_mask);
 		hits = (u32)atomic_read(&st->hit_mask);
 		done = (u32)atomic_read(&st->done_mask);
@@ -374,8 +415,8 @@ void dw_note_payload_signature(u32 pkt_id, u32 req_mask, bool is_malicious)
 			pkt_state_set_drop(st);
 		WRITE_ONCE(st->last_seen_jiffies, jiffies);
 
-		pr_info("payload marker hit pkt_id=%u req=0x%x needle=\"%s\" done=0x%x hits=0x%x -> verdict=DROP\n",
-			pkt_id, req, DW_DUMMY_NEEDLE, done, hits);
+		pr_info("payload signature hit pkt_id=%u req=0x%x source=\"%s\" done=0x%x hits=0x%x -> verdict=DROP\n",
+			pkt_id, req, DW_AC_PATTERN_LABEL, done, hits);
 	}
 	rcu_read_unlock();
 }
@@ -724,10 +765,14 @@ static void analysis_workfn(struct work_struct *w)
 		is_malicious = false;
 		break;
 	case DW_REQ_A2:
-		is_malicious = false;
+		sig_rc = snapshot_pkt_payload_contains(aw->pkt_id, DW_DUMMY_NEEDLE,
+						       &is_malicious);
+		if (sig_rc < 0)
+			pr_info("analysis pkt_id=%u bit=0x%x snapshot not available rc=%d, continuing\n",
+				aw->pkt_id, aw->bit, sig_rc);
 		break;
 	case DW_REQ_A3:
-		sig_rc = snapshot_pkt_payload_contains(aw->pkt_id, DW_DUMMY_NEEDLE,
+		sig_rc = snapshot_pkt_payload_contains(aw->pkt_id, DW_AC_PATTERN_LABEL,
 						       &is_malicious);
 		if (sig_rc < 0)
 			pr_info("analysis pkt_id=%u bit=0x%x snapshot not available rc=%d, continuing\n",
@@ -991,9 +1036,19 @@ static int __init deferred_init(void)
 	if (!dw_wq)
 		return -ENOMEM;
 
+	state_id = 0;
+	dw_ac_root = DFA_build((const void **)dw_ac_patterns, DW_AC_PATTERN_COUNT);
+	if (!dw_ac_root) {
+		destroy_workqueue(dw_wq);
+		dw_wq = NULL;
+		return -ENOMEM;
+	}
+
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &dw_kfunc_ids);
 	if (ret) {
 		pr_err("register_btf_kfunc_id_set failed: %d\n", ret);
+		DFA_free(dw_ac_root);
+		dw_ac_root = NULL;
 		destroy_workqueue(dw_wq);
 		return ret;
 	}
@@ -1026,6 +1081,10 @@ static void __exit deferred_exit(void)
 	if (dw_wq) {
 		destroy_workqueue(dw_wq);
 		dw_wq = NULL;
+	}
+	if (dw_ac_root) {
+		DFA_free(dw_ac_root);
+		dw_ac_root = NULL;
 	}
 
 	/* cleanup state_ht */

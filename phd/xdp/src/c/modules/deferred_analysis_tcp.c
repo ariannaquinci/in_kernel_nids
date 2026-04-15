@@ -15,6 +15,9 @@
 
 #include <net/tcp.h>
 
+#include "../algolib/algo-ac.h"
+#include "../algolib/algo-ac.c"
+#include "dw_ac_patterns_autogen.h"
 #include "deferred_work_tcp.h"
 #include "dw_policy.h"
 #include "dw_shared_tcp.h"
@@ -25,9 +28,9 @@ MODULE_DESCRIPTION("TCP deferred analysis backend for post-reordering stream chu
 
 #define DW_TCP_ANALYSIS_BITS 10
 #define DW_TCP_CHUNK_MAX 4096u
-#define DW_TCP_NEEDLE "malicious"
-#define DW_TCP_NEEDLE_LEN (sizeof(DW_TCP_NEEDLE) - 1)
-#define DW_TCP_TAIL_LEN (DW_TCP_NEEDLE_LEN - 1)
+#define DW_TCP_DUMMY_NEEDLE "malicious"
+#define DW_TCP_DUMMY_NEEDLE_LEN (sizeof(DW_TCP_DUMMY_NEEDLE) - 1)
+#define DW_TCP_TAIL_LEN ((DW_AC_MAX_LEN > 1) ? (DW_AC_MAX_LEN - 1) : 1)
 #define DW_TCP_REQ_A1 BIT(0)
 #define DW_TCP_REQ_A2 BIT(1)
 #define DW_TCP_REQ_MASK_2 (DW_TCP_REQ_A1 | DW_TCP_REQ_A2)
@@ -70,21 +73,44 @@ struct dw_tcp_analysis_work {
 static DEFINE_HASHTABLE(dw_tcp_flow_ht, DW_TCP_ANALYSIS_BITS);
 static DEFINE_SPINLOCK(dw_tcp_flow_lock);
 static struct workqueue_struct *dw_tcp_wq;
+static DFA_node *dw_tcp_ac_root;
 
-static bool dw_tcp_buf_contains_needle(const u8 *buf, size_t len)
+static bool dw_tcp_buf_contains_dummy(const u8 *buf, size_t len)
 {
 	size_t i;
-	size_t nlen = DW_TCP_NEEDLE_LEN;
 
-	if (!buf || len < nlen)
+	if (!buf || len < DW_TCP_DUMMY_NEEDLE_LEN)
 		return false;
 
-	for (i = 0; i + nlen <= len; i++) {
-		if (!memcmp(buf + i, DW_TCP_NEEDLE, nlen))
+	for (i = 0; i <= len - DW_TCP_DUMMY_NEEDLE_LEN; i++) {
+		if (!memcmp(buf + i, DW_TCP_DUMMY_NEEDLE, DW_TCP_DUMMY_NEEDLE_LEN))
 			return true;
 	}
-	//fsleep(3); //simulate expensive analysis
+
 	return false;
+}
+
+static bool dw_tcp_buf_contains_ac(const u8 *buf, size_t len)
+{
+	unsigned char *tmp;
+	int *match_indices = NULL;
+	int matches;
+
+	if (!dw_tcp_ac_root || !buf || len < DW_AC_MIN_LEN)
+		return false;
+
+	tmp = kmalloc(len + 1, GFP_KERNEL);
+	if (!tmp)
+		return false;
+
+	memcpy(tmp, buf, len);
+	tmp[len] = '\0';
+
+	matches = DFA_exec(dw_tcp_ac_root, tmp, &match_indices);
+	kfree(match_indices);
+	kfree(tmp);
+
+	return matches > 0;
 }
 
 static struct dw_tcp_flow_state *dw_tcp_flow_lookup_locked(u64 sock_cookie, u32 hash)
@@ -184,7 +210,7 @@ static u32 dw_tcp_chunk_req_mask(u32 scan_len)
 {
 	u32 req_mask = DW_TCP_REQ_A1;
 
-	if (scan_len >= DW_TCP_NEEDLE_LEN)
+	if (scan_len >= DW_AC_MIN_LEN)
 		req_mask |= DW_TCP_REQ_A2;
 
 	return req_mask;
@@ -225,10 +251,10 @@ static void dw_tcp_analysis_workfn(struct work_struct *work)
 
 	switch (aw->bit) {
 	case DW_TCP_REQ_A1:
-		hit = false;
+		hit = dw_tcp_buf_contains_dummy(chunk->data, chunk->len);
 		break;
 	case DW_TCP_REQ_A2:
-		hit = dw_tcp_buf_contains_needle(chunk->data, chunk->len);
+		hit = dw_tcp_buf_contains_ac(chunk->data, chunk->len);
 		break;
 	default:
 		hit = false;
@@ -455,8 +481,18 @@ static int __init deferred_analysis_tcp_init(void)
 	if (!dw_tcp_wq)
 		return -ENOMEM;
 
-	pr_info("loaded monitor flags: udp=0x%x tcp=0x%x both=0x%x chunk_max=%u needle=\"%s\"\n",
-		DW_MON_UDP, DW_MON_TCP, DW_MON_BOTH, DW_TCP_CHUNK_MAX, DW_TCP_NEEDLE);
+	state_id = 0;
+	dw_tcp_ac_root = DFA_build((const void **)dw_ac_patterns,
+				   DW_AC_PATTERN_COUNT);
+	if (!dw_tcp_ac_root) {
+		destroy_workqueue(dw_tcp_wq);
+		dw_tcp_wq = NULL;
+		return -ENOMEM;
+	}
+
+	pr_info("loaded monitor flags: udp=0x%x tcp=0x%x both=0x%x chunk_max=%u signatures=%u source=\"%s\"\n",
+		DW_MON_UDP, DW_MON_TCP, DW_MON_BOTH, DW_TCP_CHUNK_MAX,
+		DW_AC_PATTERN_COUNT, DW_AC_PATTERN_LABEL);
 	return 0;
 }
 
@@ -469,6 +505,10 @@ static void __exit deferred_analysis_tcp_exit(void)
 	if (dw_tcp_wq) {
 		destroy_workqueue(dw_tcp_wq);
 		dw_tcp_wq = NULL;
+	}
+	if (dw_tcp_ac_root) {
+		DFA_free(dw_tcp_ac_root);
+		dw_tcp_ac_root = NULL;
 	}
 
 	spin_lock_bh(&dw_tcp_flow_lock);
