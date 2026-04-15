@@ -463,8 +463,6 @@ Esito di finalizzazione:
 
 - se almeno una analisi ha prodotto hit:
   - alza `drop_armed`
-  - prende `sk`
-  - purga `sk_receive_queue`
   - chiama `tcp_abort()`
 - se nessuna analisi ha prodotto hit:
   - prova ad avanzare `approved_seq` da `from_seq` a `to_seq`
@@ -472,6 +470,21 @@ Esito di finalizzazione:
 
 Questo fa si' che `approved_seq` cresca solo dopo il completamento di
 tutte le analisi del chunk.
+
+Nota importante sul path di drop TCP:
+
+- il backend non deve purgare manualmente `sk_receive_queue`
+- la receive queue TCP ha invarianti interne delicate rispetto a
+  `copied_seq`, `seq` e `rcv_nxt`
+- una purge manuale puo' lasciare il socket in uno stato incoerente per
+  `tcp_recvmsg_locked()`
+- il path corretto e':
+  - alzare `drop_armed`
+  - lasciare che `dw_tcp_approved_len()` blocchi letture ulteriori
+  - chiudere la connessione con `tcp_abort()`
+
+In altre parole, la chiusura deve essere demandata al kernel TCP senza
+manipolare direttamente la receive queue dal backend deferred.
 
 ## Gating del read path TCP
 
