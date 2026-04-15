@@ -204,9 +204,6 @@ static void dw_tcp_finalize_chunk(struct dw_tcp_chunk_state *chunk)
 		}
 
 		if (drop_sk) {
-			lock_sock(drop_sk);
-			__skb_queue_purge(&drop_sk->sk_receive_queue);
-			release_sock(drop_sk);
 			tcp_abort(drop_sk, ECONNRESET);
 		}
 
