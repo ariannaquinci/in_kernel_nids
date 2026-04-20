@@ -24,6 +24,7 @@ struct dw_vlan_hdr {
 
 /* kfuncs exported by the kernel module */
 #ifndef DW_XDP_TCP_ONLY
+extern int dw_state_init(__u32 pkt_id, __u32 req_mask) __ksym;
 extern int dw_meta_put(struct dw_pkt_key *key, __u32 pkt_id, __u32 req_mask) __ksym;
 extern int dw_pkt_snapshot_put(const __u8 *data, __u32 len, __u32 pkt_id) __ksym;
 extern int dw_register_and_schedule(__u32 pkt_id, __u32 req_mask) __ksym;
@@ -243,13 +244,20 @@ int xdp_prog(struct xdp_md *ctx)
 	else
 		req_mask = dw_apply_deferred_budget(req_mask, DW_WORKLOAD_DEFAULT_BUDGET);
 
-	/* Step 1: register correlation for the UDP backend. */
+	/* Step 1: create per-packet state before any deferred scheduling. */
+	rc = dw_state_init(pkt_id, req_mask);
+	if (rc < 0) {
+		bpf_printk("dw_state_init failed rc=%d pkt_id=%u", rc, pkt_id);
+		return XDP_PASS;
+	}
+
+	/* Step 2: register correlation for the UDP backend. */
 	rc = dw_meta_put(&key, pkt_id, req_mask);
 	count_meta_put_fail(rc);
 	if (rc < 0)
 		return XDP_PASS;
 
-	/* Step 2: schedule deferred analyses for the UDP backend. */
+	/* Step 3: schedule deferred analyses for the UDP backend. */
 	dw_register_and_schedule(pkt_id, req_mask);
 
 	return XDP_PASS;
