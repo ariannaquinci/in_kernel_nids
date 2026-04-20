@@ -63,8 +63,10 @@ Caratteristiche:
 
 Implicazione:
 
-- il fast path del worker e dei reader non prende `state_lock`
-- `state_lock` serve ormai solo per create strutturale e teardown
+- il fast path del worker e dei reader non prende lock sulla
+  `state_ht`
+- la create della `pkt_state` avviene nel path XDP con publish lockless
+  del bucket head
 
 #### `snap_ht`
 
@@ -73,13 +75,14 @@ Implicazione:
 Caratteristiche:
 
 - il reader legge la snapshot sotto `rcu_read_lock()`
-- il replace della snapshot dello stesso `pkt_id` resta serializzato
+- la snapshot viene pubblicata nel bucket con `cmpxchg()`
+- la rimozione della snapshot usa unlink via CAS sul bucket
 - il free e' differito con `kfree_rcu()`
 
 Implicazione:
 
-- il worker puo' leggere il frame senza prendere `snap_lock`
-- `snap_lock` resta solo per replace/delete strutturale
+- il worker puo' leggere il frame senza prendere lock sulla `snap_ht`
+- il path XDP pubblica e rimuove snapshot senza un lock globale
 
 #### Worker TCP
 
@@ -100,12 +103,6 @@ Implicazione:
   convertito
 
 ### Strutture ancora lock-based
-
-#### `meta_ht`
-
-Resta lock-based perche' il suo uso principale e' `put` e `get-and-del`.
-E' un buon candidato futuro a `RCU`, ma il beneficio atteso e' inferiore
-rispetto a `state_ht` e `snap_ht`.
 
 #### `flow_ht`
 
@@ -170,15 +167,20 @@ Uso:
 Stato attuale:
 
 - lookup reader via `RCU`
+- create della `pkt_state` nel path XDP
 - update delle mask via atomiche
 - `verdict` monotono
-- lock solo per create/teardown strutturale
+- publish della nuova entry nel bucket con CAS sul puntatore head
+- teardown via `kfree_rcu()`
 
 Dettagli lockless:
 
-- il fast path tenta prima un lookup `RCU`
-- se l'entry esiste, aggiorna `req_mask` senza lock
-- solo il caso di miss prende `state_lock` per creare la nuova entry
+- il fast path dei worker e dei reader usa lookup `RCU`
+- `dw_state_init()` alloca e inizializza la `pkt_state` fuori dalla
+  tabella e la pubblica nel bucket con `cmpxchg()`
+- `dw_register_and_schedule()` assume che la `pkt_state` esista gia' e
+  non la crea piu' nel deferred path
+- se la entry manca, il backend logga `entry not found`
 
 ### `meta_ht`
 
@@ -188,6 +190,23 @@ Uso:
 
 - XDP pubblica la correlazione
 - netfilter la consuma una sola volta
+
+Stato attuale:
+
+- bucket custom indicizzati dall'hash della chiave
+- publish della nuova entry nel bucket con `cmpxchg()`
+- consume one-shot con claim atomico
+- cleanup differito delle entry claimate scadute con timeout
+
+Dettagli lockless:
+
+- `dw_meta_put()` alloca e inizializza la nuova `meta_ent` e la
+  pubblica nel bucket head con `cmpxchg()`
+- `dw_meta_get_and_del()` fa lookup del bucket e prova a rivendicare la
+  entry con `atomic_cmpxchg(&claimed, 0, 1)`
+- una entry gia' claimata non viene piu' consumata
+- le entry claimate vengono trattate come scadute dopo
+  `META_CLAIM_TIMEOUT` e rimosse con cleanup RCU
 
 ### `snap_ht`
 
@@ -202,7 +221,8 @@ Uso:
 Stato attuale:
 
 - lookup reader via `RCU`
-- replace/delete serializzati
+- publish della nuova snapshot nel bucket con CAS sul puntatore head
+- `snap_drop(pkt_id)` fa unlink della snapshot via CAS
 - free differito con `kfree_rcu()`
 
 Dettagli lockless:
@@ -230,8 +250,9 @@ Nota:
 
 ## Produzione dello stato dal lato XDP
 
-Il backend UDP esporta tre kfunc usate da XDP:
+Il backend UDP esporta quattro kfunc usate da XDP:
 
+- `dw_state_init(pkt_id, req_mask)`
 - `dw_register_and_schedule(pkt_id, req_mask)`
 - `dw_meta_put(key, pkt_id, req_mask)`
 - `dw_pkt_snapshot_put(data, len, pkt_id)`
@@ -244,7 +265,8 @@ In pratica XDP:
    - stato per-packet
    - correlazione per netfilter
    - snapshot del frame
-4. pianifica uno o piu' work item deferred in base ai bit di `req_mask`
+4. crea subito la `pkt_state` per quel `pkt_id`
+5. pianifica uno o piu' work item deferred in base ai bit di `req_mask`
 
 ## Worker deferred UDP
 
@@ -388,16 +410,22 @@ Il backend TCP usa `dw_tcp_flow_ht`, indicizzata da `sock_cookie`.
 Ogni `dw_tcp_flow_state` contiene:
 
 - `sk`
+- `refs`
+- `seq_lock`
+- `tail_lock`
 - `next_seq`
 - `approved_seq`
 - `next_seq_valid`
-- `approved_seq_valid`
 - `drop_armed`
 - `tail_len` e `tail[]`
 - `last_seen_jiffies`
 
 Significato:
 
+- `refs`: mantiene viva la flow entry anche dopo il rilascio del lock
+  globale della hashtable
+- `seq_lock`: serializza la prenotazione del prossimo chunk TCP
+- `tail_lock`: serializza `tail_len` e `tail[]`
 - `next_seq`: prossimo byte ancora da prendere dal receive queue per un
   nuovo chunk
 - `approved_seq`: massimo boundary contiguo gia' approvato
@@ -471,6 +499,17 @@ Esito di finalizzazione:
 Questo fa si' che `approved_seq` cresca solo dopo il completamento di
 tutte le analisi del chunk.
 
+Dal punto di vista della sincronizzazione:
+
+- `dw_tcp_flow_lock` protegge solo hashtable e lifecycle delle flow
+  entry
+- `refs` permette ai reader di usare il puntatore del flow dopo il
+  lookup senza tenere il lock globale
+- `seq_lock` protegge `next_seq`
+- `tail_lock` protegge `tail` e `tail_len`
+- `drop_armed` viene pubblicato con `WRITE_ONCE`
+- `approved_seq` avanza con `cmpxchg()`
+
 Nota importante sul path di drop TCP:
 
 - il backend non deve purgare manualmente `sk_receive_queue`
@@ -481,7 +520,16 @@ Nota importante sul path di drop TCP:
 - il path corretto e':
   - alzare `drop_armed`
   - lasciare che `dw_tcp_approved_len()` blocchi letture ulteriori
-  - chiudere la connessione con `tcp_abort()`
+  - chiudere la connessione con `tcp_abort()` dal worker deferred, non
+    dai probe di `tcp_recvmsg`
+
+Nota sui probe `tcp_recvmsg`:
+
+- i pre/ret handler dei kprobe girano in contesto atomico
+- quindi non possono chiamare primitive che possono schedulare come
+  `tcp_abort()`
+- nel probe path si puo' solo ridurre la read window o forzare il
+  valore di ritorno
 
 In altre parole, la chiusura deve essere demandata al kernel TCP senza
 manipolare direttamente la receive queue dal backend deferred.
@@ -494,9 +542,16 @@ effettivamente leggibili.
 Regole:
 
 - se il flow non esiste, restituisce `0`
-- se `approved_seq_valid == false`, restituisce `0`
 - se `drop_armed == true`, restituisce `0`
 - altrimenti permette fino a `approved_seq - copied_seq`
+
+Sincronizzazione del read path:
+
+- prende `dw_tcp_flow_lock` solo per il lookup e per acquisire un
+  riferimento alla flow entry
+- legge `drop_armed` e `approved_seq` senza prendere `seq_lock` o
+  `tail_lock`
+- rilascia il riferimento con `dw_tcp_flow_put()`
 
 Il kprobe su `tcp_recvmsg` usa questo valore per ridurre la `len`
 richiesta.
@@ -534,17 +589,215 @@ basato su stream e non su packet reinjection.
 
 - `state_ht`: reader lockless via `RCU`, update atomici
 - `snap_ht`: reader lockless via `RCU`
-- `meta_ht`: ancora lock-based
+- `meta_ht`: claim atomico e cleanup per timeout
 - `flow_ht`: ancora lock-based
 
 ### TCP
 
 - il worker deferred non fa piu' lookup nella hashtable
 - `dw_tcp_flow_lock` protegge ancora create/lookup e stato per-flow
-  come `next_seq` e `tail`
+  come `next_seq` e `tail`, tramite lock distinti
 - `drop_armed` e `approved_seq` hanno gia' update senza lock nel worker
 - il chunk TCP usa ora stato condiviso per-chunk con `done_mask`,
   `hit_mask` e `pending` atomici
+
+## Mappa Della Sincronizzazione
+
+Questa sezione riassume, in modo trasversale ai backend UDP e TCP,
+dove il codice usa:
+
+- spinlock
+- `RCU`
+- operazioni atomiche o primitive affini come `cmpxchg`,
+  `READ_ONCE/WRITE_ONCE` e `refcount`
+
+### Punti Dove Si Prende Lock
+
+#### UDP
+
+`state_ht`
+
+- non usa piu' un lock globale per la create della `pkt_state`
+- `dw_state_init()` pubblica la nuova entry nel bucket con CAS sul
+  puntatore head
+- il teardown finale svuota i bucket e rilascia le `pkt_state` con
+  `kfree_rcu()`
+
+`snap_ht`
+
+- non usa piu' un lock globale
+- `dw_pkt_snapshot_put()` pubblica la nuova snapshot nel bucket con
+  `cmpxchg()`
+- `snap_drop()` rimuove la snapshot con unlink via CAS
+- il teardown finale svuota i bucket con `xchg()` e rilascia le
+  snapshot con `kfree_rcu()`
+
+`meta_ht`
+
+- non usa piu' un lock globale
+- `dw_meta_put()` pubblica la nuova entry nel bucket con `cmpxchg()`
+- `dw_meta_get_and_del()` fa claim atomico della entry
+- il teardown finale svuota i bucket con `xchg()` e rilascia le
+  `meta_ent` con `kfree_rcu()`
+
+`flow_lock`
+
+- protegge `flow_ht` e la FIFO mutabile di ogni flow
+- viene preso in `dw_buffer_nfqueue_entry()` per lookup/create del
+  flow e `list_add_tail()` della `nf_queue_entry`
+- viene preso in `__dw_try_deliver_ready()` per osservare la testa
+  della FIFO, rimuovere entry pronte e liberare flow vuoti
+- viene temporaneamente rilasciato attorno a `nf_reinject()`
+- viene preso in `dw_quiesce_nfqueue()` per drenare tutte le code
+- viene preso nel teardown finale di `flow_ht`
+
+#### TCP
+
+`dw_tcp_flow_lock`
+
+- protegge la hashtable `dw_tcp_flow_ht` e il lifecycle strutturale
+  delle flow entry
+- viene preso in `dw_tcp_enqueue_stream()` per `lookup/create` e
+  acquisizione del riferimento alla flow
+- viene preso in `dw_tcp_is_drop_armed()` per `lookup + get ref`
+- viene preso in `dw_tcp_approved_len()` per `lookup + get ref`
+- viene preso nel teardown finale per iterare `dw_tcp_flow_ht`,
+  fare `hash_del()` e rilasciare il riferimento strutturale
+
+`seq_lock`
+
+- protegge la prenotazione del chunk TCP nel singolo flow
+- viene preso in `dw_tcp_enqueue_stream()` per:
+  - controllare `drop_armed` nel path di prenotazione del chunk
+  - inizializzare `next_seq` e `approved_seq` al primo utilizzo
+  - avanzare `next_seq`
+
+`tail_lock`
+
+- protegge `tail_len` e `tail[]`
+- viene preso in `dw_tcp_enqueue_stream()` per leggere il prefisso del
+  chunk precedente
+- viene preso di nuovo in `dw_tcp_enqueue_stream()` per aggiornare
+  `tail_len` e `tail[]` dopo la costruzione del chunk
+
+### Punti Dove Si Usa RCU
+
+#### UDP
+
+`state_ht`
+
+- i reader fanno `rcu_read_lock()`
+- il lookup usa `state_lookup_rcu()` su bucket custom indicizzati da
+  `pkt_id`
+- gli inserimenti pubblicano la nuova entry nel bucket con `cmpxchg()`
+- il teardown svuota i bucket con `xchg()` e poi rilascia le entry
+  con `kfree_rcu()`
+- il free usa `kfree_rcu()`
+
+Reader RCU espliciti su `state_ht`:
+
+- `dw_get_done_mask()`
+- `dw_get_verdict()`
+- `dw_note_payload_signature()`
+- il fast path di `dw_register_and_schedule()`
+
+`snap_ht`
+
+- i reader fanno `rcu_read_lock()`
+- il lookup usa `snap_lookup_rcu()` su bucket custom indicizzati da
+  `pkt_id`
+- gli inserimenti pubblicano la nuova snapshot nel bucket con
+  `cmpxchg()`
+- la rimozione usa unlink via CAS sul bucket
+- il free usa `kfree_rcu()`
+
+Reader RCU espliciti su `snap_ht`:
+
+- `snapshot_pkt_payload_contains()`
+
+`meta_ht`
+
+- i reader fanno `rcu_read_lock()` durante il lookup della correlazione
+- il lookup usa bucket custom indicizzati dall'hash della chiave
+- gli inserimenti pubblicano la nuova entry nel bucket con `cmpxchg()`
+- `dw_meta_get_and_del()` consuma la correlazione con claim atomico
+- il cleanup unlinka le entry claimate scadute e le libera con
+  `kfree_rcu()`
+
+#### TCP
+
+- allo stato attuale il backend TCP non usa `RCU` sulla flow table
+- la stabilita' del puntatore `dw_tcp_flow_state *` e' garantita da
+  `refcount`, non da `RCU`
+
+### Punti Dove Si Usano Operazioni Atomiche O Primitive Affini
+
+#### UDP
+
+Stato per-packet `pkt_state`:
+
+- `req_mask`: `atomic_set`, `atomic_or`, `atomic_read`
+- `done_mask`: `atomic_set`, `atomic_or`, `atomic_read`
+- `hit_mask`: `atomic_set`, `atomic_or`, `atomic_read`
+- `verdict`: `atomic_set`, `atomic_cmpxchg`, CAS loop
+- `last_seen_jiffies`: `WRITE_ONCE`
+- `pkt_id`: letto con `READ_ONCE` nei path RCU
+
+Worker deferred UDP:
+
+- aggiorna `hit_mask` e `done_mask` con `atomic_or()`
+- legge `req_mask`, `done_mask` e `hit_mask` con `atomic_read()`
+- aggiorna `last_seen_jiffies` con `WRITE_ONCE`
+
+Stato globale UDP:
+
+- `st_pending`, `st_delivered`, `st_dropped`
+- `rr_cpu`
+- `delivery_running`, `delivery_kicked`
+- `nfq_stopping`, `nfq_quiescing`, `dw_stopping`
+
+Primitive usate sullo stato globale UDP:
+
+- `atomic_inc`, `atomic_dec`
+- `atomic_inc_return`
+- `atomic_read`
+- `atomic_set`
+- `atomic_cmpxchg`
+- `atomic_xchg`
+
+#### TCP
+
+Stato per-flow TCP:
+
+- `drop_armed`: scritto con `WRITE_ONCE`, letto con `READ_ONCE`
+- `approved_seq`: avanzato con `cmpxchg`, letto con `READ_ONCE`
+- `last_seen_jiffies`: scritto con `WRITE_ONCE`
+- `sk`: letto con `READ_ONCE` nel worker prima di `tcp_abort()`
+- `tp->copied_seq` e `tp->rcv_nxt`: letti con `READ_ONCE`
+
+Stato per-chunk TCP:
+
+- `done_mask`: `atomic_set`, `atomic_or`, `atomic_read`
+- `hit_mask`: `atomic_set`, `atomic_or`, `atomic_read`
+- `pending`: `atomic_set`, `atomic_dec_and_test`
+
+Lifetime della flow TCP:
+
+- `refs` usa `refcount_t`
+- primitive usate:
+  - `refcount_set`
+  - `refcount_inc`
+  - `refcount_dec_and_test`
+
+Il `refcount` permette a:
+
+- `dw_tcp_enqueue_stream()`
+- `dw_tcp_is_drop_armed()`
+- `dw_tcp_approved_len()`
+- worker deferred TCP
+
+di usare `dw_tcp_flow_state *` dopo il rilascio di `dw_tcp_flow_lock`
+senza rischio di free anticipato.
 
 ## Osservazione finale
 

@@ -36,7 +36,8 @@ static int dw_tcp_recvmsg_pre(struct kprobe *p, struct pt_regs *regs)
 		return 0;
 
 	if (dw_tcp_is_drop_armed(sk)) {
-		tcp_abort(sk, ECONNRESET);
+		/* Probe handlers run in atomic context: only gate the read path here. */
+		regs->dx = 0;
 		return 0;
 	}
 
@@ -67,7 +68,6 @@ static int dw_tcp_recvmsg_ret(struct kretprobe_instance *ri, struct pt_regs *reg
 	if (!ctx->sk || !dw_tcp_is_drop_armed(ctx->sk))
 		return 0;
 
-	tcp_abort(ctx->sk, ECONNRESET);
 	regs_set_return_value(regs, (unsigned long)-ECONNRESET);
 	return 0;
 }

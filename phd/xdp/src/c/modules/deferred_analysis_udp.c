@@ -41,13 +41,13 @@ struct pkt_state {
 	atomic_t hit_mask;  /* bitmask di analisi con match malevolo */
 	atomic_t verdict; /* 0 unknown, 1 pass, 2 drop */
 	unsigned long last_seen_jiffies;
-	struct hlist_node hnode;
+	struct pkt_state *next;
 	struct rcu_head rcu;
 };
 
 #define STATE_BITS 12
-static DEFINE_HASHTABLE(state_ht, STATE_BITS);
-static DEFINE_SPINLOCK(state_lock);
+#define STATE_BUCKETS (1U << STATE_BITS)
+static struct pkt_state *state_ht[STATE_BUCKETS];
 
 /* -------- correlation table: fingerprint -> (pkt_id, req_mask) -------- */
 
@@ -56,12 +56,16 @@ struct meta_ent {
 	u32 pkt_id;
 	u32 req_mask;
 	unsigned long ts_jiffies;
-	struct hlist_node hnode;
+	unsigned long claimed_jiffies;
+	atomic_t claimed;
+	struct meta_ent *next;
+	struct rcu_head rcu;
 };
 
 #define META_BITS 12
-static DEFINE_HASHTABLE(meta_ht, META_BITS);
-static DEFINE_SPINLOCK(meta_lock);
+#define META_BUCKETS (1U << META_BITS)
+#define META_CLAIM_TIMEOUT (5 * HZ)
+static struct meta_ent *meta_ht[META_BUCKETS];
 
 /* -------- XDP packet snapshots: pkt_id -> frame copy -------- */
 
@@ -70,14 +74,14 @@ struct pkt_snap_ent {
 	u32 frame_len;
 	u32 cap_len;
 	unsigned long ts_jiffies;
-	struct hlist_node hnode;
+	struct pkt_snap_ent *next;
 	struct rcu_head rcu;
 	u8 data[];
 };
 
 #define SNAP_BITS 12
-static DEFINE_HASHTABLE(snap_ht, SNAP_BITS);
-static DEFINE_SPINLOCK(snap_lock);
+#define SNAP_BUCKETS (1U << SNAP_BITS)
+static struct pkt_snap_ent *snap_ht[SNAP_BUCKETS];
 
 /* -------- per-flow buffering (FIFO per preservare ordine del flow) -------- */
 
@@ -174,21 +178,19 @@ struct dw_vlan_hdr {
 	__be16 enc_proto;
 } __packed;
 
-static struct pkt_state *state_lookup_locked(u32 pkt_id)
+static inline u32 state_bucket(u32 pkt_id)
 {
-	struct pkt_state *st;
-	hash_for_each_possible(state_ht, st, hnode, pkt_id) {
-		if (st->pkt_id == pkt_id)
-			return st;
-	}
-	return NULL;
+	return hash_min(pkt_id, STATE_BITS);
 }
+
+static bool dw_module_is_stopping(void);
 
 static struct pkt_state *state_lookup_rcu(u32 pkt_id)
 {
 	struct pkt_state *st;
+	u32 bkt = state_bucket(pkt_id);
 
-	hash_for_each_possible_rcu(state_ht, st, hnode, pkt_id) {
+	for (st = READ_ONCE(state_ht[bkt]); st; st = READ_ONCE(st->next)) {
 		if (READ_ONCE(st->pkt_id) == pkt_id)
 			return st;
 	}
@@ -196,7 +198,7 @@ static struct pkt_state *state_lookup_rcu(u32 pkt_id)
 	return NULL;
 }
 
-static struct pkt_state *state_create_locked(u32 pkt_id, u32 req_mask)
+static struct pkt_state *state_alloc(u32 pkt_id, u32 req_mask)
 {
 	struct pkt_state *st;
 
@@ -210,9 +212,55 @@ static struct pkt_state *state_create_locked(u32 pkt_id, u32 req_mask)
 	atomic_set(&st->hit_mask, 0);
 	atomic_set(&st->verdict, DW_VERDICT_UNKNOWN);
 	st->last_seen_jiffies = jiffies;
-
-	hash_add_rcu(state_ht, &st->hnode, pkt_id);
+	st->next = NULL;
 	return st;
+}
+
+static __bpf_kfunc int dw_state_init(u32 pkt_id, u32 req_mask)
+{
+	struct pkt_state *st;
+	struct pkt_state *new_st;
+	struct pkt_state *head;
+	u32 bkt;
+
+	if (dw_module_is_stopping())
+		return -ESHUTDOWN;
+
+	if (!pkt_id || !req_mask)
+		return -EINVAL;
+
+	rcu_read_lock();
+	st = state_lookup_rcu(pkt_id);
+	if (st) {
+		atomic_or(req_mask & DW_REQ_MASK_3, &st->req_mask);
+		WRITE_ONCE(st->last_seen_jiffies, jiffies);
+		rcu_read_unlock();
+		return 0;
+	}
+	rcu_read_unlock();
+
+	new_st = state_alloc(pkt_id, req_mask);
+	if (!new_st)
+		return -ENOMEM;
+
+	bkt = state_bucket(pkt_id);
+	for (;;) {
+		head = READ_ONCE(state_ht[bkt]);
+		WRITE_ONCE(new_st->next, head);
+		if (cmpxchg(&state_ht[bkt], head, new_st) == head)
+			return 0;
+
+		rcu_read_lock();
+		st = state_lookup_rcu(pkt_id);
+		if (st) {
+			atomic_or(req_mask & DW_REQ_MASK_3, &st->req_mask);
+			WRITE_ONCE(st->last_seen_jiffies, jiffies);
+			rcu_read_unlock();
+			kfree(new_st);
+			return 0;
+		}
+		rcu_read_unlock();
+	}
 }
 
 static void pkt_state_try_set_pass(struct pkt_state *st)
@@ -233,22 +281,17 @@ static void pkt_state_set_drop(struct pkt_state *st)
 	}
 }
 
-static struct pkt_snap_ent *snap_lookup_locked(u32 pkt_id)
+static inline u32 snap_bucket(u32 pkt_id)
 {
-	struct pkt_snap_ent *e;
-
-	hash_for_each_possible(snap_ht, e, hnode, pkt_id) {
-		if (e->pkt_id == pkt_id)
-			return e;
-	}
-	return NULL;
+	return hash_min(pkt_id, SNAP_BITS);
 }
 
 static struct pkt_snap_ent *snap_lookup_rcu(u32 pkt_id)
 {
 	struct pkt_snap_ent *e;
+	u32 bkt = snap_bucket(pkt_id);
 
-	hash_for_each_possible_rcu(snap_ht, e, hnode, pkt_id) {
+	for (e = READ_ONCE(snap_ht[bkt]); e; e = READ_ONCE(e->next)) {
 		if (READ_ONCE(e->pkt_id) == pkt_id)
 			return e;
 	}
@@ -256,18 +299,94 @@ static struct pkt_snap_ent *snap_lookup_rcu(u32 pkt_id)
 	return NULL;
 }
 
+static inline u32 meta_bucket_hash(u32 h)
+{
+	return hash_min(h, META_BITS);
+}
+
+static bool meta_claim_expired(struct meta_ent *e, unsigned long now)
+{
+	unsigned long claimed_at;
+
+	if (!atomic_read(&e->claimed))
+		return false;
+
+	claimed_at = READ_ONCE(e->claimed_jiffies);
+	return time_after_eq(now, claimed_at + META_CLAIM_TIMEOUT);
+}
+
+static bool meta_try_unlink(u32 bkt, struct meta_ent *prev, struct meta_ent *cur)
+{
+	struct meta_ent *next = READ_ONCE(cur->next);
+
+	if (prev)
+		return cmpxchg(&prev->next, cur, next) == cur;
+
+	return cmpxchg(&meta_ht[bkt], cur, next) == cur;
+}
+
+static void meta_gc_bucket(u32 bkt, unsigned long now)
+{
+	struct meta_ent *prev = NULL;
+	struct meta_ent *cur;
+
+retry:
+	rcu_read_lock();
+	prev = NULL;
+	for (cur = READ_ONCE(meta_ht[bkt]); cur; cur = READ_ONCE(cur->next)) {
+		if (!meta_claim_expired(cur, now)) {
+			prev = cur;
+			continue;
+		}
+
+		if (!meta_try_unlink(bkt, prev, cur)) {
+			rcu_read_unlock();
+			goto retry;
+		}
+
+		WRITE_ONCE(cur->next, NULL);
+		kfree_rcu(cur, rcu);
+		rcu_read_unlock();
+		goto retry;
+	}
+	rcu_read_unlock();
+}
+
 static void snap_drop(u32 pkt_id)
 {
+	struct pkt_snap_ent *prev = NULL;
 	struct pkt_snap_ent *e;
+	struct pkt_snap_ent *next;
+	u32 bkt = snap_bucket(pkt_id);
 
-	spin_lock_bh(&snap_lock);
-	e = snap_lookup_locked(pkt_id);
-	if (e)
-		hash_del_rcu(&e->hnode);
-	spin_unlock_bh(&snap_lock);
+retry:
+	rcu_read_lock();
+	prev = NULL;
+	for (e = READ_ONCE(snap_ht[bkt]); e; e = READ_ONCE(e->next)) {
+		if (READ_ONCE(e->pkt_id) != pkt_id) {
+			prev = e;
+			continue;
+		}
 
-	if (e)
+		next = READ_ONCE(e->next);
+		if (prev) {
+			if (cmpxchg(&prev->next, e, next) != e) {
+				rcu_read_unlock();
+				goto retry;
+			}
+		} else {
+			if (cmpxchg(&snap_ht[bkt], e, next) != e) {
+				rcu_read_unlock();
+				goto retry;
+			}
+		}
+
+		WRITE_ONCE(e->next, NULL);
 		kfree_rcu(e, rcu);
+		rcu_read_unlock();
+		return;
+	}
+	rcu_read_unlock();
 }
 
 static bool frame_udp_payload_contains(const u8 *frame, u32 frame_len, const char *needle)
@@ -526,6 +645,8 @@ static __bpf_kfunc int dw_meta_put(struct dw_pkt_key *key, u32 pkt_id, u32 req_m
 {
 	struct meta_ent *e;
 	u32 h;
+	u32 bkt;
+	struct meta_ent *head;
 
 	if (dw_module_is_stopping())
 		return -ESHUTDOWN;
@@ -541,20 +662,29 @@ static __bpf_kfunc int dw_meta_put(struct dw_pkt_key *key, u32 pkt_id, u32 req_m
 	e->pkt_id = pkt_id;
 	e->req_mask = req_mask & DW_REQ_MASK_3;
 	e->ts_jiffies = jiffies;
+	e->claimed_jiffies = 0;
+	atomic_set(&e->claimed, 0);
+	e->next = NULL;
 
 	h = jhash(&e->key, sizeof(e->key), 0);
+	bkt = meta_bucket_hash(h);
+	meta_gc_bucket(bkt, jiffies);
 
-	spin_lock_bh(&meta_lock);
-	hash_add(meta_ht, &e->hnode, h);
-	spin_unlock_bh(&meta_lock);
+	for (;;) {
+		head = READ_ONCE(meta_ht[bkt]);
+		WRITE_ONCE(e->next, head);
+		if (cmpxchg(&meta_ht[bkt], head, e) == head)
+			return 0;
+	}
 
-	return 0;
 }
 
 static __bpf_kfunc int dw_pkt_snapshot_put(const u8 *data, u32 len, u32 pkt_id)
 {
-	struct pkt_snap_ent *e, *old;
+	struct pkt_snap_ent *e;
+	struct pkt_snap_ent *head;
 	u32 cap_len;
+	u32 bkt;
 
 	if (dw_module_is_stopping())
 		return -ESHUTDOWN;
@@ -571,18 +701,17 @@ static __bpf_kfunc int dw_pkt_snapshot_put(const u8 *data, u32 len, u32 pkt_id)
 	e->frame_len = len;
 	e->cap_len = cap_len;
 	e->ts_jiffies = jiffies;
+	e->next = NULL;
 	memcpy(e->data, data, cap_len);
 
-	old = NULL;
-	spin_lock_bh(&snap_lock);
-	old = snap_lookup_locked(pkt_id);
-	if (old)
-		hash_del_rcu(&old->hnode);
-	hash_add_rcu(snap_ht, &e->hnode, pkt_id);
-	spin_unlock_bh(&snap_lock);
-
-	if (old)
-		kfree_rcu(old, rcu);
+	snap_drop(pkt_id);
+	bkt = snap_bucket(pkt_id);
+	for (;;) {
+		head = READ_ONCE(snap_ht[bkt]);
+		WRITE_ONCE(e->next, head);
+		if (cmpxchg(&snap_ht[bkt], head, e) == head)
+			break;
+	}
 
 	if (len > cap_len)
 		pr_info("snapshot pkt_id=%u truncated frame_len=%u cap_len=%u\n",
@@ -596,24 +725,37 @@ bool dw_meta_get_and_del(struct dw_pkt_key *key, u32 *pkt_id_out, u32 *req_mask_
 {
 	struct meta_ent *e;
 	u32 h;
+	u32 bkt;
+	unsigned long now;
 
 	if (!key)
 		return false;
 
 	h = jhash(key, sizeof(*key), 0);
+	bkt = meta_bucket_hash(h);
+	now = jiffies;
+	rcu_read_lock();
+	for (e = READ_ONCE(meta_ht[bkt]); e; e = READ_ONCE(e->next)) {
+		if (!key_equal(&e->key, key))
+			continue;
 
-	spin_lock_bh(&meta_lock);
-	hash_for_each_possible(meta_ht, e, hnode, h) {
-		if (key_equal(&e->key, key)) {
-			if (pkt_id_out)   *pkt_id_out = e->pkt_id;
-			if (req_mask_out) *req_mask_out = e->req_mask;
-			hash_del(&e->hnode);
-			spin_unlock_bh(&meta_lock);
-			kfree(e);
-			return true;
-		}
+		if (meta_claim_expired(e, now))
+			continue;
+
+		if (atomic_cmpxchg(&e->claimed, 0, 1) != 0)
+			continue;
+
+		WRITE_ONCE(e->claimed_jiffies, now);
+		if (pkt_id_out)
+			*pkt_id_out = READ_ONCE(e->pkt_id);
+		if (req_mask_out)
+			*req_mask_out = READ_ONCE(e->req_mask);
+		rcu_read_unlock();
+		return true;
 	}
-	spin_unlock_bh(&meta_lock);
+	rcu_read_unlock();
+
+	meta_gc_bucket(bkt, now);
 	return false;
 }
 EXPORT_SYMBOL_GPL(dw_meta_get_and_del);
@@ -622,7 +764,6 @@ EXPORT_SYMBOL_GPL(dw_meta_get_and_del);
 
 struct analysis_work {
 	struct work_struct work;
-	struct pkt_state *st;
 	u32 pkt_id;
 	u32 bit;
 };
@@ -751,7 +892,7 @@ static void dw_try_deliver_ready(void)
 static void analysis_workfn(struct work_struct *w)
 {
 	struct analysis_work *aw = container_of(w, struct analysis_work, work);
-	struct pkt_state *st = aw->st;
+	struct pkt_state *st;
 	u32 req_mask, done, hits;
 	bool is_malicious = false;
 	bool terminal = false;
@@ -782,6 +923,8 @@ static void analysis_workfn(struct work_struct *w)
 		break;
 	}
 
+	rcu_read_lock();
+	st = state_lookup_rcu(aw->pkt_id);
 	if (st) {
 		if (is_malicious)
 			atomic_or(aw->bit, &st->hit_mask);
@@ -798,6 +941,7 @@ static void analysis_workfn(struct work_struct *w)
 
 		WRITE_ONCE(st->last_seen_jiffies, jiffies);
 	}
+	rcu_read_unlock();
 
 	if (st) {
 		pr_info("analysis pkt_id=%u bit=0x%x done=0x%x/0x%x hits=0x%x verdict=%s\n",
@@ -836,20 +980,10 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 	rcu_read_unlock();
 
 	if (!st) {
-		spin_lock_bh(&state_lock);
-		st = state_lookup_locked(pkt_id);
-		if (st) {
-			atomic_or(req_mask & DW_REQ_MASK_3, &st->req_mask);
-			WRITE_ONCE(st->last_seen_jiffies, jiffies);
-		} else {
-			st = state_create_locked(pkt_id, req_mask);
-		}
-		spin_unlock_bh(&state_lock);
-	}
-
-	if (!st) {
+		pr_err("dw_register_and_schedule entry not found pkt_id=%u req=0x%x\n",
+		       pkt_id, req_mask & DW_REQ_MASK_3);
 		atomic_inc(&st_dropped);
-		return -ENOMEM;
+		return -ENOENT;
 	}
 
 	ncpus = num_online_cpus();
@@ -867,7 +1001,6 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 			continue;
 		}
 		INIT_WORK(&aw->work, analysis_workfn);
-		aw->st = st;
 		aw->pkt_id = pkt_id;
 		aw->bit = bit;
 
@@ -880,6 +1013,7 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 
 /* export kfunc set for XDP */
 BTF_SET8_START(dw_kfunc_set)
+BTF_ID_FLAGS(func, dw_state_init,            KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, dw_register_and_schedule, KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, dw_meta_put,              KF_TRUSTED_ARGS)
 BTF_ID_FLAGS(func, dw_pkt_snapshot_put,      0)
@@ -1022,10 +1156,7 @@ static int __init deferred_init(void)
 {
 	int ret;
 
-	hash_init(state_ht);
-	hash_init(meta_ht);
 	hash_init(flow_ht);
-	hash_init(snap_ht);
 	atomic_set(&nfq_stopping, 0);
 	atomic_set(&nfq_quiescing, 0);
 	atomic_set(&delivery_running, 0);
@@ -1088,20 +1219,26 @@ static void __exit deferred_exit(void)
 	}
 
 	/* cleanup state_ht */
-	spin_lock_bh(&state_lock);
-	hash_for_each_safe(state_ht, bkt, tmp, st, hnode) {
-		hash_del_rcu(&st->hnode);
-		kfree_rcu(st, rcu);
+	for (bkt = 0; bkt < STATE_BUCKETS; bkt++) {
+		st = xchg(&state_ht[bkt], NULL);
+		while (st) {
+			struct pkt_state *next = st->next;
+			WRITE_ONCE(st->next, NULL);
+			kfree_rcu(st, rcu);
+			st = next;
+		}
 	}
-	spin_unlock_bh(&state_lock);
 
 	/* cleanup meta_ht */
-	spin_lock_bh(&meta_lock);
-	hash_for_each_safe(meta_ht, bkt, tmp, me, hnode) {
-		hash_del(&me->hnode);
-		kfree(me);
+	for (bkt = 0; bkt < META_BUCKETS; bkt++) {
+		me = xchg(&meta_ht[bkt], NULL);
+		while (me) {
+			struct meta_ent *next = me->next;
+			WRITE_ONCE(me->next, NULL);
+			kfree_rcu(me, rcu);
+			me = next;
+		}
 	}
-	spin_unlock_bh(&meta_lock);
 
 	/* cleanup flow_ht (per-flow buffered items) */
 	spin_lock_bh(&flow_lock);
@@ -1117,12 +1254,15 @@ static void __exit deferred_exit(void)
 	spin_unlock_bh(&flow_lock);
 
 	/* cleanup snap_ht (XDP frame snapshots) */
-	spin_lock_bh(&snap_lock);
-	hash_for_each_safe(snap_ht, bkt, tmp, se, hnode) {
-		hash_del_rcu(&se->hnode);
-		kfree_rcu(se, rcu);
+	for (bkt = 0; bkt < SNAP_BUCKETS; bkt++) {
+		se = xchg(&snap_ht[bkt], NULL);
+		while (se) {
+			struct pkt_snap_ent *next = se->next;
+			WRITE_ONCE(se->next, NULL);
+			kfree_rcu(se, rcu);
+			se = next;
+		}
 	}
-	spin_unlock_bh(&snap_lock);
 
 	pr_info("unloaded\n");
 }

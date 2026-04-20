@@ -10,6 +10,7 @@
 #include <linux/errno.h>
 #include <linux/slab.h>
 #include <linux/atomic.h>
+#include <linux/refcount.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 
@@ -38,10 +39,12 @@ MODULE_DESCRIPTION("TCP deferred analysis backend for post-reordering stream chu
 struct dw_tcp_flow_state {
 	u64 sock_cookie;
 	struct sock *sk;
+	refcount_t refs;
+	spinlock_t seq_lock;
+	spinlock_t tail_lock;
 	u32 next_seq;
 	u32 approved_seq;
 	bool next_seq_valid;
-	bool approved_seq_valid;
 	bool drop_armed;
 	u8 tail_len;
 	u8 tail[DW_TCP_TAIL_LEN];
@@ -125,12 +128,40 @@ static struct dw_tcp_flow_state *dw_tcp_flow_lookup_locked(u64 sock_cookie, u32 
 	return NULL;
 }
 
+static void dw_tcp_flow_free(struct dw_tcp_flow_state *state)
+{
+	if (!state)
+		return;
+
+	if (state->sk)
+		sock_put(state->sk);
+	kfree(state);
+}
+
+static void dw_tcp_flow_put(struct dw_tcp_flow_state *state)
+{
+	if (state && refcount_dec_and_test(&state->refs))
+		dw_tcp_flow_free(state);
+}
+
+static struct dw_tcp_flow_state *dw_tcp_flow_lookup_get_locked(u64 sock_cookie, u32 hash)
+{
+	struct dw_tcp_flow_state *state;
+
+	state = dw_tcp_flow_lookup_locked(sock_cookie, hash);
+	if (state)
+		refcount_inc(&state->refs);
+
+	return state;
+}
+
 static struct dw_tcp_flow_state *dw_tcp_flow_get_locked(struct sock *sk, u64 sock_cookie, u32 hash)
 {
 	struct dw_tcp_flow_state *state;
 
 	state = dw_tcp_flow_lookup_locked(sock_cookie, hash);
 	if (state) {
+		refcount_inc(&state->refs);
 		state->last_seen_jiffies = jiffies;
 		return state;
 	}
@@ -141,6 +172,9 @@ static struct dw_tcp_flow_state *dw_tcp_flow_get_locked(struct sock *sk, u64 soc
 
 	state->sock_cookie = sock_cookie;
 	state->sk = sk;
+	refcount_set(&state->refs, 2);
+	spin_lock_init(&state->seq_lock);
+	spin_lock_init(&state->tail_lock);
 	state->last_seen_jiffies = jiffies;
 	sock_hold(sk);
 	hash_add(dw_tcp_flow_ht, &state->hnode, hash);
@@ -238,9 +272,11 @@ static void dw_tcp_finalize_chunk(struct dw_tcp_chunk_state *chunk)
 			chunk->scan_from_seq, chunk->scan_to_seq, chunk->len,
 			(u32)atomic_read(&chunk->done_mask), hits);
 	} else {
-		if (state && READ_ONCE(state->approved_seq_valid))
+		if (state)
 			cmpxchg(&state->approved_seq, chunk->from_seq, chunk->to_seq);
 	}
+
+	dw_tcp_flow_put(state);
 }
 
 static void dw_tcp_analysis_workfn(struct work_struct *work)
@@ -306,13 +342,14 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 
 	spin_lock_bh(&dw_tcp_flow_lock);
 	state = dw_tcp_flow_get_locked(sk, sock_cookie, hash);
-	if (!state) {
-		spin_unlock_bh(&dw_tcp_flow_lock);
+	spin_unlock_bh(&dw_tcp_flow_lock);
+	if (!state)
 		return -ENOMEM;
-	}
 
-	if (state->drop_armed) {
-		spin_unlock_bh(&dw_tcp_flow_lock);
+	spin_lock_bh(&state->seq_lock);
+	if (READ_ONCE(state->drop_armed)) {
+		spin_unlock_bh(&state->seq_lock);
+		dw_tcp_flow_put(state);
 		return -EPERM;
 	}
 
@@ -320,30 +357,34 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 		state->next_seq = READ_ONCE(tp->copied_seq);
 		state->next_seq_valid = true;
 		state->approved_seq = state->next_seq;
-		state->approved_seq_valid = true;
 	}
-
-	prefix_len = state->tail_len;
-	if (prefix_len)
-		memcpy(prefix, state->tail, prefix_len);
 
 	available_end = READ_ONCE(tp->rcv_nxt);
 	from_seq = state->next_seq;
 	if (!before(from_seq, available_end)) {
-		spin_unlock_bh(&dw_tcp_flow_lock);
+		spin_unlock_bh(&state->seq_lock);
+		dw_tcp_flow_put(state);
 		return 0;
 	}
 
 	chunk_len = min_t(u32, available_end - from_seq, DW_TCP_CHUNK_MAX);
 	to_seq = from_seq + chunk_len;
 	state->next_seq = to_seq;
-	state->last_seen_jiffies = jiffies;
-	spin_unlock_bh(&dw_tcp_flow_lock);
+	WRITE_ONCE(state->last_seen_jiffies, jiffies);
+	spin_unlock_bh(&state->seq_lock);
+
+	spin_lock_bh(&state->tail_lock);
+	prefix_len = state->tail_len;
+	if (prefix_len)
+		memcpy(prefix, state->tail, prefix_len);
+	spin_unlock_bh(&state->tail_lock);
 
 	alloc_len = prefix_len + chunk_len;
 	chunk = kzalloc(struct_size(chunk, data, alloc_len), GFP_ATOMIC);
-	if (!chunk)
+	if (!chunk) {
+		dw_tcp_flow_put(state);
 		return -ENOMEM;
+	}
 
 	chunk->sock_cookie = sock_cookie;
 	chunk->state = state;
@@ -357,6 +398,7 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 
 	copied = dw_tcp_copy_stream_chunk(sk, from_seq, to_seq, chunk->data + prefix_len);
 	if (copied <= 0) {
+		dw_tcp_flow_put(state);
 		kfree(chunk);
 		return copied ? copied : -ENODATA;
 	}
@@ -368,15 +410,12 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	atomic_set(&chunk->hit_mask, 0);
 
 	next_tail_len = min_t(u8, chunk->len, DW_TCP_TAIL_LEN);
-	spin_lock_bh(&dw_tcp_flow_lock);
-	state = dw_tcp_flow_lookup_locked(sock_cookie, hash);
-	if (state) {
-		state->tail_len = next_tail_len;
-		if (next_tail_len)
-			memcpy(state->tail, chunk->data + chunk->len - next_tail_len, next_tail_len);
-		state->last_seen_jiffies = jiffies;
-	}
-	spin_unlock_bh(&dw_tcp_flow_lock);
+	spin_lock_bh(&state->tail_lock);
+	state->tail_len = next_tail_len;
+	if (next_tail_len)
+		memcpy(state->tail, chunk->data + chunk->len - next_tail_len, next_tail_len);
+	WRITE_ONCE(state->last_seen_jiffies, jiffies);
+	spin_unlock_bh(&state->tail_lock);
 
 	cpu = dw_tcp_hash_to_cpu(sock_cookie);
 	for (i = 0; i < ARRAY_SIZE(analysis_bits); i++) {
@@ -409,6 +448,7 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 err_alloc:
 	while (--i >= 0)
 		kfree(aw[i]);
+	dw_tcp_flow_put(state);
 	kfree(chunk);
 	return -ENOMEM;
 }
@@ -428,10 +468,13 @@ bool dw_tcp_is_drop_armed(struct sock *sk)
 	hash = jhash_1word((u32)sock_cookie, (u32)(sock_cookie >> 32));
 
 	spin_lock_bh(&dw_tcp_flow_lock);
-	state = dw_tcp_flow_lookup_locked(sock_cookie, hash);
-	if (state)
-		armed = state->drop_armed;
+	state = dw_tcp_flow_lookup_get_locked(sock_cookie, hash);
 	spin_unlock_bh(&dw_tcp_flow_lock);
+	if (!state)
+		return false;
+
+	armed = READ_ONCE(state->drop_armed);
+	dw_tcp_flow_put(state);
 
 	return armed;
 }
@@ -454,13 +497,17 @@ size_t dw_tcp_approved_len(struct sock *sk, size_t requested_len)
 	copied_seq = READ_ONCE(tcp_sk(sk)->copied_seq);
 
 	spin_lock_bh(&dw_tcp_flow_lock);
-	state = dw_tcp_flow_lookup_locked(sock_cookie, hash);
-	if (!state || !state->approved_seq_valid || state->drop_armed) {
+	state = dw_tcp_flow_lookup_get_locked(sock_cookie, hash);
+	spin_unlock_bh(&dw_tcp_flow_lock);
+	if (!state)
+		return 0;
+
+	if (READ_ONCE(state->drop_armed)) {
 		allowed = 0;
 		goto out;
 	}
 
-	approved_seq = state->approved_seq;
+	approved_seq = READ_ONCE(state->approved_seq);
 	if (!before(copied_seq, approved_seq)) {
 		allowed = 0;
 		goto out;
@@ -469,7 +516,7 @@ size_t dw_tcp_approved_len(struct sock *sk, size_t requested_len)
 	allowed = min_t(size_t, requested_len, (size_t)(approved_seq - copied_seq));
 
 out:
-	spin_unlock_bh(&dw_tcp_flow_lock);
+	dw_tcp_flow_put(state);
 	return allowed;
 }
 EXPORT_SYMBOL_GPL(dw_tcp_approved_len);
@@ -514,9 +561,7 @@ static void __exit deferred_analysis_tcp_exit(void)
 	spin_lock_bh(&dw_tcp_flow_lock);
 	hash_for_each_safe(dw_tcp_flow_ht, bkt, tmp, state, hnode) {
 		hash_del(&state->hnode);
-		if (state->sk)
-			sock_put(state->sk);
-		kfree(state);
+		dw_tcp_flow_put(state);
 	}
 	spin_unlock_bh(&dw_tcp_flow_lock);
 
