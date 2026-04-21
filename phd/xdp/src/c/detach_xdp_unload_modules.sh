@@ -170,7 +170,7 @@ build_module_list() {
     # Reverse known dependency order for this project: protocol hooks first,
     # auxiliary modules next, and deferred backends last.
     local ordered=()
-    for mod in tcp_stream_hook netfilter_hook_udp netfilter_hook udp_nfqueue_gate deferred_analysis_tcp deferred_analysis_udp deferred_analysis; do
+    for mod in tcp_stream_hook netfilter_hook_udp netfilter_hook udp_nfqueue_gate deferred_analysis_tcp deferred_analysis_udp; do
         if printf '%s\n' "${mods[@]}" | grep -qx "$mod"; then
             ordered+=("$mod")
         fi

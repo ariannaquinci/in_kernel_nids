@@ -10,6 +10,7 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 
+#include "dw_print.h"
 #include "deferred_work_tcp.h"
 #include "dw_policy.h"
 #include "dw_shared_tcp.h"
@@ -42,6 +43,12 @@ static int dw_tcp_recvmsg_pre(struct kprobe *p, struct pt_regs *regs)
 	}
 
 	allowed = dw_tcp_approved_len(sk, req_len);
+	/*
+	 * Forcing len=0 on a live socket makes many callers observe a spurious
+	 * EOF while deferred analysis is still in flight. Only clamp positive
+	 * approved windows; keep the original request size while nothing has
+	 * been approved yet.
+	 */
 	if (allowed > 0 && allowed < req_len)
 		regs->dx = allowed;
 

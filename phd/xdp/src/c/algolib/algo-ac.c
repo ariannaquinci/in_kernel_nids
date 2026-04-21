@@ -1,9 +1,11 @@
 #include "algo-ac.h"
 #ifdef __KERNEL__
-#define STAMPA printk
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sort.h>
+#ifndef STAMPA
+#define STAMPA(...) pr_debug(__VA_ARGS__)
+#endif
 #define REQUEST_MM(x) kmalloc(x,GFP_KERNEL)
 #define REALLOC_MM(x,y) krealloc(x,y,GFP_KERNEL)
 #define FREE_MM(x) kfree(x)

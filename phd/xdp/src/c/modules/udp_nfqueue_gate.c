@@ -13,6 +13,7 @@
 #include <linux/compiler.h>
 #include <linux/printk.h>
 
+#include "dw_print.h"
 #include "nids_shared.h"
 
 MODULE_LICENSE("GPL");
