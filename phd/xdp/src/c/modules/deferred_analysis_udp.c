@@ -9,7 +9,6 @@
 #include <linux/workqueue.h>
 #include <linux/slab.h>
 #include <linux/atomic.h>
-#include <linux/spinlock.h>
 #include <linux/jiffies.h>
 #include <linux/delay.h>
 #include <linux/netdevice.h>
@@ -23,6 +22,7 @@
 
 #include <net/ip.h>
 
+#include "dw_print.h"
 #include "../algolib/algo-ac.h"
 #include "../algolib/algo-ac.c"
 #include "dw_ac_patterns_autogen.h"
@@ -83,7 +83,7 @@ struct pkt_snap_ent {
 #define SNAP_BUCKETS (1U << SNAP_BITS)
 static struct pkt_snap_ent *snap_ht[SNAP_BUCKETS];
 
-/* -------- per-flow buffering (FIFO per preservare ordine del flow) -------- */
+/* -------- per-flow buffering lock-free (head/tail ring per flow) -------- */
 
 struct dw_flow_key {
 	u32 saddr;
@@ -95,23 +95,29 @@ struct dw_flow_key {
 	u16 pad2;
 } __aligned(4);
 
-struct flow_ent {
-	struct dw_flow_key key;
-	struct list_head q;
-	unsigned long last_seen_jiffies;
-	struct hlist_node hnode;
-};
-
 struct dw_buf_ent {
-	struct list_head node;
 	struct nf_queue_entry *qent;
 	u32 pkt_id;
 	u32 req_mask;
+	u32 pos;
+	bool ready;
 };
 
 #define FLOW_BITS 12
-static DEFINE_HASHTABLE(flow_ht, FLOW_BITS);
-static DEFINE_SPINLOCK(flow_lock);
+#define FLOW_BUCKETS (1U << FLOW_BITS)
+#define DW_FLOW_RING_SIZE 256U
+#define DW_FLOW_RING_MASK (DW_FLOW_RING_SIZE - 1)
+
+struct flow_ent {
+	struct dw_flow_key key;
+	struct flow_ent *next;
+	atomic_t tail;
+	u32 head;
+	unsigned long last_seen_jiffies;
+	struct dw_buf_ent ring[DW_FLOW_RING_SIZE];
+};
+
+static struct flow_ent *flow_ht[FLOW_BUCKETS];
 
 static struct workqueue_struct *dw_wq;
 
@@ -181,6 +187,11 @@ struct dw_vlan_hdr {
 static inline u32 state_bucket(u32 pkt_id)
 {
 	return hash_min(pkt_id, STATE_BITS);
+}
+
+static inline u32 flow_bucket_hash(u32 h)
+{
+	return hash_min(h, FLOW_BITS);
 }
 
 static bool dw_module_is_stopping(void);
@@ -607,37 +618,58 @@ static bool skb_build_flow_key_ipv4_udp(struct sk_buff *skb, struct dw_flow_key 
 	return true;
 }
 
-static struct flow_ent *flow_lookup_locked(const struct dw_flow_key *key, u32 h)
+static struct flow_ent *flow_lookup_rcu(const struct dw_flow_key *key, u32 h)
 {
 	struct flow_ent *fe;
+	u32 bkt = flow_bucket_hash(h);
 
-	hash_for_each_possible(flow_ht, fe, hnode, h) {
+	for (fe = READ_ONCE(flow_ht[bkt]); fe; fe = READ_ONCE(fe->next)) {
 		if (flow_key_equal(&fe->key, key))
 			return fe;
 	}
 	return NULL;
 }
 
-static struct flow_ent *flow_get_or_create_locked(const struct dw_flow_key *key, u32 h)
+static struct flow_ent *flow_get_or_create(const struct dw_flow_key *key, u32 h)
 {
 	struct flow_ent *fe;
+	struct flow_ent *head;
+	u32 bkt = flow_bucket_hash(h);
 
-	fe = flow_lookup_locked(key, h);
+	rcu_read_lock();
+	fe = flow_lookup_rcu(key, h);
 	if (fe) {
-		fe->last_seen_jiffies = jiffies;
+		WRITE_ONCE(fe->last_seen_jiffies, jiffies);
+		rcu_read_unlock();
 		return fe;
 	}
+	rcu_read_unlock();
 
 	fe = kzalloc(sizeof(*fe), GFP_ATOMIC);
 	if (!fe)
 		return NULL;
 
 	memcpy(&fe->key, key, sizeof(*key));
-	INIT_LIST_HEAD(&fe->q);
+	atomic_set(&fe->tail, 0);
+	WRITE_ONCE(fe->head, 0);
 	fe->last_seen_jiffies = jiffies;
-	hash_add(flow_ht, &fe->hnode, h);
 
-	return fe;
+	for (;;) {
+		head = READ_ONCE(flow_ht[bkt]);
+		WRITE_ONCE(fe->next, head);
+		if (cmpxchg(&flow_ht[bkt], head, fe) == head)
+			return fe;
+
+		rcu_read_lock();
+		head = flow_lookup_rcu(key, h);
+		if (head) {
+			WRITE_ONCE(head->last_seen_jiffies, jiffies);
+			rcu_read_unlock();
+			kfree(fe);
+			return head;
+		}
+		rcu_read_unlock();
+	}
 }
 
 /* kfunc: correlation put (XDP writes) */
@@ -768,23 +800,52 @@ struct analysis_work {
 	u32 bit;
 };
 
+static int flow_try_reserve_slot(struct flow_ent *fe, u32 *pos_out)
+{
+	for (;;) {
+		u32 head = READ_ONCE(fe->head);
+		u32 tail = (u32)atomic_read(&fe->tail);
+
+		if (tail - head >= DW_FLOW_RING_SIZE)
+			return -ENOSPC;
+
+		if (atomic_cmpxchg(&fe->tail, tail, tail + 1) == tail) {
+			*pos_out = tail;
+			return 0;
+		}
+
+		cpu_relax();
+	}
+}
+
+static struct dw_buf_ent *flow_slot_at(struct flow_ent *fe, u32 pos)
+{
+	return &fe->ring[pos & DW_FLOW_RING_MASK];
+}
+
 static void __dw_try_deliver_ready(void)
 {
 	struct flow_ent *fe;
-	struct dw_buf_ent *be;
-	struct hlist_node *tmp;
 	struct nf_queue_entry *qent;
 	bool stopping;
 	int bkt;
 
-	spin_lock_bh(&flow_lock);
-	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
+	for (bkt = 0; bkt < FLOW_BUCKETS; bkt++) {
+		for (fe = READ_ONCE(flow_ht[bkt]); fe; fe = READ_ONCE(fe->next)) {
+			u32 head = READ_ONCE(fe->head);
+
 		for (;;) {
+			struct dw_buf_ent *be;
 			u32 pkt_id, req, done;
+			u32 tail;
 			int verdict;
 
-			be = list_first_entry_or_null(&fe->q, struct dw_buf_ent, node);
-			if (!be)
+			tail = (u32)atomic_read(&fe->tail);
+			if (head == tail)
+				break;
+
+			be = flow_slot_at(fe, head);
+			if (!smp_load_acquire(&be->ready) || READ_ONCE(be->pos) != head)
 				break;
 
 			pkt_id = be->pkt_id;
@@ -793,32 +854,32 @@ static void __dw_try_deliver_ready(void)
 			verdict = dw_get_verdict(pkt_id);
 
 			if (stopping) {
-				list_del(&be->node);
 				pr_info("deliver flow-head pkt_id=%u req=0x%x teardown -> accept queued packet\n",
 					pkt_id, req);
-				spin_unlock_bh(&flow_lock);
 				snap_drop(pkt_id);
-				nf_reinject(be->qent, NF_ACCEPT);
-				kfree(be);
+				qent = be->qent;
+				WRITE_ONCE(be->qent, NULL);
+				smp_store_release(&be->ready, false);
+				WRITE_ONCE(fe->head, ++head);
+				nf_reinject(qent, NF_ACCEPT);
 				atomic_dec(&st_pending);
 				atomic_inc(&st_delivered);
-				spin_lock_bh(&flow_lock);
-				fe->last_seen_jiffies = jiffies;
+				WRITE_ONCE(fe->last_seen_jiffies, jiffies);
 				continue;
 			}
 
 			if (verdict == DW_VERDICT_DROP) {
-				list_del(&be->node);
 				pr_info("deliver flow-head pkt_id=%u req=0x%x verdict=DROP -> drop queued packet\n",
 					pkt_id, req);
-				spin_unlock_bh(&flow_lock);
 				snap_drop(pkt_id);
-				nf_reinject(be->qent, NF_DROP);
-				kfree(be);
+				qent = be->qent;
+				WRITE_ONCE(be->qent, NULL);
+				smp_store_release(&be->ready, false);
+				WRITE_ONCE(fe->head, ++head);
+				nf_reinject(qent, NF_DROP);
 				atomic_dec(&st_pending);
 				atomic_inc(&st_dropped);
-				spin_lock_bh(&flow_lock);
-				fe->last_seen_jiffies = jiffies;
+				WRITE_ONCE(fe->last_seen_jiffies, jiffies);
 				continue;
 			}
 
@@ -828,28 +889,21 @@ static void __dw_try_deliver_ready(void)
 				break;
 			}
 
-			list_del(&be->node);
 			pr_info("deliver flow-head pkt_id=%u req=0x%x done=0x%x verdict=PASS -> reinject\n",
 				pkt_id, req, done);
-			spin_unlock_bh(&flow_lock);
 			snap_drop(pkt_id);
 
 			qent = be->qent;
+			WRITE_ONCE(be->qent, NULL);
+			smp_store_release(&be->ready, false);
+			WRITE_ONCE(fe->head, ++head);
 			nf_reinject(qent, NF_ACCEPT);
 			atomic_inc(&st_delivered);
-			kfree(be);
 			atomic_dec(&st_pending);
-
-			spin_lock_bh(&flow_lock);
-			fe->last_seen_jiffies = jiffies;
-		}
-
-		if (list_empty(&fe->q)) {
-			hash_del(&fe->hnode);
-			kfree(fe);
+			WRITE_ONCE(fe->last_seen_jiffies, jiffies);
 		}
 	}
-	spin_unlock_bh(&flow_lock);
+	}
 }
 
 static void dw_try_deliver_ready(void)
@@ -861,10 +915,9 @@ static void dw_try_deliver_ready(void)
 
 	for (;;) {
 		/*
-		 * Only one drainer may walk flow_ht at a time. The delivery
-		 * path drops flow_lock around nf_reinject(), so concurrent
-		 * drainers can otherwise free the same flow while another
-		 * caller still holds a raw pointer to it.
+		 * Only one drainer may walk flow_ht at a time. Even without
+		 * per-flow locks, keeping a single consumer preserves the
+		 * circular-buffer head invariant for each flow.
 		 */
 		atomic_set(&delivery_kicked, 0);
 		__dw_try_deliver_ready();
@@ -1028,10 +1081,11 @@ static const struct btf_kfunc_id_set dw_kfunc_ids = {
 
 int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_mask)
 {
-	struct dw_buf_ent *be;
 	struct dw_flow_key fkey;
 	u32 h;
+	u32 pos;
 	struct flow_ent *fe;
+	struct dw_buf_ent *be;
 	int verdict;
 
 	if (!entry || !entry->skb)
@@ -1061,33 +1115,34 @@ int dw_buffer_nfqueue_entry(struct nf_queue_entry *entry, u32 pkt_id, u32 req_ma
 		return -EINVAL;
 	}
 
-	be = kzalloc(sizeof(*be), GFP_ATOMIC);
-	if (!be) {
-		atomic_inc(&st_dropped);
-		return -ENOMEM;
-	}
-	be->qent = entry;
-	be->pkt_id = pkt_id;
-	be->req_mask = req_mask & DW_REQ_MASK_3;
-
 	h = jhash(&fkey, sizeof(fkey), 0);
-	spin_lock_bh(&flow_lock);
-	fe = flow_get_or_create_locked(&fkey, h);
+	fe = flow_get_or_create(&fkey, h);
 	if (!fe) {
-		spin_unlock_bh(&flow_lock);
-		kfree(be);
 		atomic_inc(&st_dropped);
 		return -ENOMEM;
 	}
+
+	if (flow_try_reserve_slot(fe, &pos) < 0) {
+		pr_info("flow ring full pkt_id=%u req=0x%x -> drop queued packet\n",
+			pkt_id, req_mask & DW_REQ_MASK_3);
+		snap_drop(pkt_id);
+		nf_reinject(entry, NF_DROP);
+		atomic_inc(&st_dropped);
+		return DW_NFQ_DROPPED;
+	}
+
 	if (!nf_queue_entry_get_refs(entry)) {
-		spin_unlock_bh(&flow_lock);
-		kfree(be);
 		atomic_inc(&st_dropped);
 		return -EINVAL;
 	}
-	list_add_tail(&be->node, &fe->q);
-	fe->last_seen_jiffies = jiffies;
-	spin_unlock_bh(&flow_lock);
+
+	be = flow_slot_at(fe, pos);
+	be->qent = entry;
+	be->pkt_id = pkt_id;
+	be->req_mask = req_mask & DW_REQ_MASK_3;
+	be->pos = pos;
+	smp_store_release(&be->ready, true);
+	WRITE_ONCE(fe->last_seen_jiffies, jiffies);
 
 	atomic_inc(&st_pending);
 	dw_try_deliver_ready();
@@ -1097,10 +1152,7 @@ EXPORT_SYMBOL_GPL(dw_buffer_nfqueue_entry);
 
 void dw_quiesce_nfqueue(void)
 {
-	LIST_HEAD(drop_list);
 	struct flow_ent *fe;
-	struct dw_buf_ent *be, *be_tmp;
-	struct hlist_node *tmp;
 	int bkt;
 
 	if (atomic_cmpxchg(&nfq_quiescing, 0, 1) != 0) {
@@ -1119,29 +1171,36 @@ void dw_quiesce_nfqueue(void)
 	while (atomic_cmpxchg(&delivery_running, 0, 1) != 0)
 		usleep_range(1000, 2000);
 
-	spin_lock_bh(&flow_lock);
-	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
-		hash_del(&fe->hnode);
-		list_for_each_entry_safe(be, be_tmp, &fe->q, node) {
-			list_del(&be->node);
-			list_add_tail(&be->node, &drop_list);
-		}
-		kfree(fe);
-	}
-	spin_unlock_bh(&flow_lock);
+	for (bkt = 0; bkt < FLOW_BUCKETS; bkt++) {
+		for (fe = READ_ONCE(flow_ht[bkt]); fe; fe = READ_ONCE(fe->next)) {
+			u32 head = READ_ONCE(fe->head);
+			u32 tail = (u32)atomic_read(&fe->tail);
 
-	list_for_each_entry_safe(be, be_tmp, &drop_list, node) {
-		list_del(&be->node);
-		snap_drop(be->pkt_id);
-		/*
-		 * Complete each queued packet through NFQUEUE before unregistering
-		 * the queue handler, otherwise the queue core may still consider
-		 * the entry in flight and stall module teardown.
-		 */
-		nf_reinject(be->qent, NF_ACCEPT);
-		atomic_dec(&st_pending);
-		atomic_inc(&st_delivered);
-		kfree(be);
+			while (head != tail) {
+				struct dw_buf_ent *be = flow_slot_at(fe, head);
+
+				if (smp_load_acquire(&be->ready) &&
+				    READ_ONCE(be->pos) == head &&
+				    READ_ONCE(be->qent)) {
+					snap_drop(be->pkt_id);
+					/*
+					 * Complete each queued packet through NFQUEUE
+					 * before unregistering the queue handler,
+					 * otherwise the queue core may still consider
+					 * the entry in flight and stall module
+					 * teardown.
+					 */
+					nf_reinject(be->qent, NF_ACCEPT);
+					atomic_dec(&st_pending);
+					atomic_inc(&st_delivered);
+					WRITE_ONCE(be->qent, NULL);
+					smp_store_release(&be->ready, false);
+				}
+				head++;
+			}
+
+			WRITE_ONCE(fe->head, head);
+		}
 	}
 
 	atomic_set(&delivery_kicked, 0);
@@ -1156,7 +1215,7 @@ static int __init deferred_init(void)
 {
 	int ret;
 
-	hash_init(flow_ht);
+	memset(flow_ht, 0, sizeof(flow_ht));
 	atomic_set(&nfq_stopping, 0);
 	atomic_set(&nfq_quiescing, 0);
 	atomic_set(&delivery_running, 0);
@@ -1193,9 +1252,7 @@ static void __exit deferred_exit(void)
 	struct pkt_state *st;
 	struct meta_ent *me;
 	struct flow_ent *fe;
-	struct dw_buf_ent *be, *be_tmp;
 	struct pkt_snap_ent *se;
-	struct hlist_node *tmp;
 	int bkt;
 
 	/*
@@ -1241,17 +1298,25 @@ static void __exit deferred_exit(void)
 	}
 
 	/* cleanup flow_ht (per-flow buffered items) */
-	spin_lock_bh(&flow_lock);
-	hash_for_each_safe(flow_ht, bkt, tmp, fe, hnode) {
-		hash_del(&fe->hnode);
-		list_for_each_entry_safe(be, be_tmp, &fe->q, node) {
-			list_del(&be->node);
-			nf_queue_entry_free(be->qent);
-			kfree(be);
+	for (bkt = 0; bkt < FLOW_BUCKETS; bkt++) {
+		fe = xchg(&flow_ht[bkt], NULL);
+		while (fe) {
+			struct flow_ent *next = READ_ONCE(fe->next);
+			u32 head = READ_ONCE(fe->head);
+			u32 tail = (u32)atomic_read(&fe->tail);
+
+			while (head != tail) {
+				struct dw_buf_ent *be = flow_slot_at(fe, head);
+
+				if (smp_load_acquire(&be->ready) && READ_ONCE(be->qent))
+					nf_queue_entry_free(be->qent);
+				head++;
+			}
+
+			kfree(fe);
+			fe = next;
 		}
-		kfree(fe);
 	}
-	spin_unlock_bh(&flow_lock);
 
 	/* cleanup snap_ht (XDP frame snapshots) */
 	for (bkt = 0; bkt < SNAP_BUCKETS; bkt++) {
