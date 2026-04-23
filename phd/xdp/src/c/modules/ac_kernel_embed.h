@@ -26,10 +26,10 @@ static inline void *dw_ac_realloc(void *ptr, size_t size)
 #undef realloc
 #undef malloc
 
-static inline DFA_node *dw_ac_build_patterns(const char *const *patterns, size_t count)
+static inline DFA_node *dw_ac_build_patterns(const char *const *patterns, size_t count,int *array,int size_h_s)
 {
 	state_id = 0;
-	return DFA_build((const void **)patterns, count);
+	return DFA_build((const void **)patterns, count,array,size_h_s);
 }
 
 static inline bool dw_ac_match_bytes(DFA_node *root, const u8 *buf, size_t len)
