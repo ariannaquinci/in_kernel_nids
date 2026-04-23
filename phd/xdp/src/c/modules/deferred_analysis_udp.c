@@ -136,7 +136,7 @@ static atomic_t dw_stopping      = ATOMIC_INIT(0);
 #define DW_DUMMY_NEEDLE "malicious"
 #define DW_DUMMY_NEEDLE_LEN (sizeof(DW_DUMMY_NEEDLE) - 1)
 
-static DFA_node *dw_ac_root;
+static DFA_struct *dw_ac_root;
 
 static bool dw_bytes_contains(const u8 *buf, size_t len,
 			      const u8 *needle, size_t needle_len)
@@ -469,7 +469,7 @@ static bool frame_udp_payload_contains(const u8 *frame, u32 frame_len, const cha
 	if (strcmp(needle, DW_AC_PATTERN_LABEL))
 		return false;
 
-	return dw_ac_match_bytes(dw_ac_root, frame + payload_off, payload_len);
+	return dw_ac_match_bytes(dw_ac_root->root, frame + payload_off, payload_len);
 }
 
 static int snapshot_pkt_payload_contains(u32 pkt_id, const char *needle, bool *found_out)
@@ -1211,6 +1211,14 @@ EXPORT_SYMBOL_GPL(dw_quiesce_nfqueue);
 
 /* -------- module init/exit -------- */
 
+
+
+static int hot_state_array[20];
+static int hot_state_size = 0;
+
+module_param_array(hot_state_array, int, &hot_state_size, 0660);
+
+
 static int __init deferred_init(void)
 {
 	int ret;
@@ -1227,7 +1235,7 @@ static int __init deferred_init(void)
 		return -ENOMEM;
 
 	state_id = 0;
-	dw_ac_root = DFA_build((const void **)dw_ac_patterns, DW_AC_PATTERN_COUNT);
+	dw_ac_root = DFA_build((const void **)dw_ac_patterns, DW_AC_PATTERN_COUNT,hot_state_array,hot_state_size);
 	if (!dw_ac_root) {
 		destroy_workqueue(dw_wq);
 		dw_wq = NULL;

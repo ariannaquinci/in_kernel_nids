@@ -91,9 +91,9 @@ struct dw_tcp_analysis_work {
 	u32 bit;
 };
 
-static struct dw_tcp_flow_state *dw_tcp_flow_ht[DW_TCP_FLOW_BUCKETS];
+struct dw_tcp_flow_state *dw_tcp_flow_ht[DW_TCP_FLOW_BUCKETS];
 static struct workqueue_struct *dw_tcp_wq;
-static DFA_node *dw_tcp_ac_root;
+static DFA_struct *dw_tcp_ac_root;
 
 static bool dw_tcp_buf_contains_dummy(const u8 *buf, size_t len)
 {
@@ -126,7 +126,7 @@ static bool dw_tcp_buf_contains_ac(const u8 *buf, size_t len)
 	memcpy(tmp, buf, len);
 	tmp[len] = '\0';
 
-	matches = DFA_exec(dw_tcp_ac_root, tmp, &match_indices);
+	matches = DFA_exec(dw_tcp_ac_root->root, tmp, &match_indices);
 	kfree(match_indices);
 	kfree(tmp);
 
@@ -764,8 +764,13 @@ out:
 	dw_tcp_flow_put(state);
 	return allowed;
 }
-EXPORT_SYMBOL_GPL(dw_tcp_approved_len);
 
+static int hot_state_array[20];
+static int hot_state_size = 0;
+
+module_param_array(hot_state_array, int, &hot_state_size, 0660);
+
+EXPORT_SYMBOL_GPL(dw_tcp_approved_len);
 static int __init deferred_analysis_tcp_init(void)
 {
 	memset(dw_tcp_flow_ht, 0, sizeof(dw_tcp_flow_ht));
@@ -774,8 +779,7 @@ static int __init deferred_analysis_tcp_init(void)
 		return -ENOMEM;
 
 	state_id = 0;
-	dw_tcp_ac_root = DFA_build((const void **)dw_ac_patterns,
-				   DW_AC_PATTERN_COUNT);
+	dw_tcp_ac_root = DFA_build((const void **)dw_ac_patterns,DW_AC_PATTERN_COUNT,hot_state_array,hot_state_size);
 	if (!dw_tcp_ac_root) {
 		destroy_workqueue(dw_tcp_wq);
 		dw_tcp_wq = NULL;

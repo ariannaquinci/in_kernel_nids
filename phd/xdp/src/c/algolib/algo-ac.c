@@ -93,8 +93,27 @@ static void DFA_create_failure_link(DFA_node * root){
     FREE_MM(queue);
 }
 
-DFA_node * DFA_build(const void **dictionary,int size)
+DFA_node* find_by_state_id(DFA_node *node, int target_id) {
+    if (node == NULL)
+        return NULL;
+
+    if (node->state_id == target_id)
+        return node;
+
+    for (int i = 0; i < ALPHABET_SIZE; i++) {
+        DFA_node *res = find_by_state_id(node->link[i], target_id);
+        if (res != NULL)
+            return res;
+    }
+
+    return NULL;
+}
+
+DFA_struct * DFA_build(const void **dictionary,int size,int * hot_state,int size_hot_state)
 {
+	DFA_struct * DFA = (DFA_struct *) REQUEST_MM(sizeof(DFA_struct));
+	DFA_node ** hot_state_node = (DFA_node **) REQUEST_MM(size_hot_state*sizeof(DFA_node*)); 
+	
 	DFA_node * root = create_dfa_node();
 	if(root == NULL) return NULL;
 	int max_lenght = 0;
@@ -104,16 +123,30 @@ DFA_node * DFA_build(const void **dictionary,int size)
 		DFA_insert(root,dictionary[i],i);
 	}
 	DFA_create_failure_link(root);
-	return root;
+	int i;
+	for(i=0;i<size_hot_state;i++){
+		hot_state_node[i]=find_by_state_id(root,hot_state[i]);	
+	}
+	DFA->root=root;
+	DFA->hot_state=hot_state_node;
+	DFA->hot_state_size=size_hot_state;
+	return DFA;
 }
 
-void DFA_free(DFA_node *node){
-	if (node == NULL) return;
+void DFA_node_free(DFA_node *root){
+	if (root == NULL) return;
+	DFA_node * node = root;
     	for (int i = 0; i < ALPHABET_SIZE ; i++)
     	{
-    		if (node->link[i] != NULL) DFA_free(node->link[i]);
+    		if (node->link[i] != NULL) DFA_node_free(node->link[i]);
     	}
    	FREE_MM(node);
+}
+void DFA_free(DFA_struct * dfa){
+	if(dfa == NULL) return;
+	DFA_node_free(dfa->root);
+	FREE_MM(dfa->hot_state);
+	FREE_MM(dfa);
 }
 int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices){
 
