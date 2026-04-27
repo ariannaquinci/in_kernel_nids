@@ -27,9 +27,6 @@ struct workload_state {
 #define DW_WORKLOAD_DEFAULT_BUDGET          3u
 #define DW_WORKLOAD_UPDATE_INTERVAL_NS      250000000ULL
 #define DW_WORKLOAD_MAX_CPUS                256u
-#define DW_CPU_BUSY_MEDIUM_PCT              60u
-#define DW_CPU_BUSY_HIGH_PCT                85u
-#define DW_CPU_BUSY_CRITICAL_PCT            95u
 #define DW_NET_RX_MEDIUM_PCT                10u
 #define DW_NET_RX_HIGH_PCT                  20u
 #define DW_NET_RX_CRITICAL_PCT              35u
@@ -56,24 +53,6 @@ static __always_inline __u32 dw_budget_for_level(__u32 level)
 	default:
 		return DW_WORKLOAD_DEFAULT_BUDGET;
 	}
-}
-
-static __always_inline __u32 dw_workload_level_from_cpu_busy(__u32 busy_cpus,
-							     __u32 total_cpus)
-{
-	__u32 busy_pct;
-
-	if (!total_cpus)
-		return DW_WORKLOAD_LOW;
-
-	busy_pct = (busy_cpus * 100u) / total_cpus;
-	if (busy_pct < DW_CPU_BUSY_MEDIUM_PCT)
-		return DW_WORKLOAD_LOW;
-	if (busy_pct < DW_CPU_BUSY_HIGH_PCT)
-		return DW_WORKLOAD_MEDIUM;
-	if (busy_pct < DW_CPU_BUSY_CRITICAL_PCT)
-		return DW_WORKLOAD_HIGH;
-	return DW_WORKLOAD_CRITICAL;
 }
 
 static __always_inline __u32 dw_workload_level_from_pct(__u32 pct,
@@ -103,20 +82,14 @@ static __always_inline __u32 dw_workload_level_from_latency_us(__u32 latency_us)
 	return DW_WORKLOAD_CRITICAL;
 }
 
-static __always_inline __u32 dw_workload_level_from_signals(__u32 cpu_busy_pct,
-							    __u32 net_rx_pct,
+static __always_inline __u32 dw_workload_level_from_signals(__u32 net_rx_pct,
 							    __u32 runqueue_latency_us)
 {
-	__u32 level = dw_workload_level_from_pct(cpu_busy_pct,
-						 DW_CPU_BUSY_MEDIUM_PCT,
-						 DW_CPU_BUSY_HIGH_PCT,
-						 DW_CPU_BUSY_CRITICAL_PCT);
+	__u32 level = dw_workload_level_from_pct(net_rx_pct,
+						 DW_NET_RX_MEDIUM_PCT,
+						 DW_NET_RX_HIGH_PCT,
+						 DW_NET_RX_CRITICAL_PCT);
 
-	level = dw_max_u32(level,
-			   dw_workload_level_from_pct(net_rx_pct,
-						      DW_NET_RX_MEDIUM_PCT,
-						      DW_NET_RX_HIGH_PCT,
-						      DW_NET_RX_CRITICAL_PCT));
 	level = dw_max_u32(level,
 			   dw_workload_level_from_latency_us(runqueue_latency_us));
 	return level;

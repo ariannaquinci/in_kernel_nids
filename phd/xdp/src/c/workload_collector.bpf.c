@@ -4,12 +4,8 @@
 #include "workload_shared.h"
 
 struct cpu_run_state {
-	__u32 is_busy;
 	__u32 in_net_rx_softirq;
 	__u32 pad;
-	__u64 last_sched_ts_ns;
-	__u64 busy_time_ns;
-	__u64 idle_time_ns;
 	__u64 softirq_enter_ns;
 	__u64 net_rx_softirq_time_ns;
 	__u64 runnable_count;
@@ -19,13 +15,9 @@ struct cpu_run_state {
 
 struct collector_state {
 	__u64 last_update_ns;
-	__u64 total_busy_time_ns;
-	__u64 total_idle_time_ns;
 	__u64 total_net_rx_softirq_time_ns;
 	__u64 total_runqueue_latency_ns;
 	__u64 total_runqueue_latency_samples;
-	__u64 prev_busy_time_ns;
-	__u64 prev_idle_time_ns;
 	__u64 prev_net_rx_softirq_time_ns;
 	__u64 prev_runqueue_latency_ns;
 	__u64 prev_runqueue_latency_samples;
@@ -65,38 +57,13 @@ struct {
 
 #define DW_SOFTIRQ_NET_RX 3u
 
-static __always_inline void dw_account_cpu_time(struct cpu_run_state *cpu_state,
-						struct collector_state *collector,
-						__u64 now)
-{
-	__u64 delta;
-
-	if (!cpu_state->last_sched_ts_ns) {
-		cpu_state->last_sched_ts_ns = now;
-		return;
-	}
-
-	delta = now - cpu_state->last_sched_ts_ns;
-	if (cpu_state->is_busy) {
-		cpu_state->busy_time_ns += delta;
-		__sync_fetch_and_add(&collector->total_busy_time_ns, delta);
-	} else {
-		cpu_state->idle_time_ns += delta;
-		__sync_fetch_and_add(&collector->total_idle_time_ns, delta);
-	}
-
-	cpu_state->last_sched_ts_ns = now;
-}
-
 static __always_inline void dw_publish_workload(__u64 now)
 {
 	__u32 collector_key = 0;
 	__u32 workload_key = DW_WORKLOAD_MAP_KEY;
 	struct collector_state *collector;
 	struct workload_state next = {};
-	__u64 window_busy_ns;
-	__u64 window_idle_ns;
-	__u64 window_total_cpu_ns;
+	__u64 window_elapsed_ns;
 	__u64 window_net_rx_ns;
 	__u64 window_runqueue_latency_ns;
 	__u64 window_runqueue_latency_samples;
@@ -108,9 +75,7 @@ static __always_inline void dw_publish_workload(__u64 now)
 	if (now - collector->last_update_ns < DW_WORKLOAD_UPDATE_INTERVAL_NS)
 		return;
 
-	window_busy_ns = collector->total_busy_time_ns - collector->prev_busy_time_ns;
-	window_idle_ns = collector->total_idle_time_ns - collector->prev_idle_time_ns;
-	window_total_cpu_ns = window_busy_ns + window_idle_ns;
+	window_elapsed_ns = now - collector->last_update_ns;
 	window_net_rx_ns = collector->total_net_rx_softirq_time_ns -
 		collector->prev_net_rx_softirq_time_ns;
 	window_runqueue_latency_ns = collector->total_runqueue_latency_ns -
@@ -118,24 +83,19 @@ static __always_inline void dw_publish_workload(__u64 now)
 	window_runqueue_latency_samples = collector->total_runqueue_latency_samples -
 		collector->prev_runqueue_latency_samples;
 
-	if (window_total_cpu_ns) {
-		next.cpu_busy_pct = (__u32)((window_busy_ns * 100ULL) / window_total_cpu_ns);
-		next.net_rx_softirq_pct = (__u32)((window_net_rx_ns * 100ULL) / window_total_cpu_ns);
-	}
+	if (window_elapsed_ns)
+		next.net_rx_softirq_pct = (__u32)((window_net_rx_ns * 100ULL) / window_elapsed_ns);
 
 	if (window_runqueue_latency_samples) {
 		next.avg_runqueue_latency_us =
 			(__u32)((window_runqueue_latency_ns / window_runqueue_latency_samples) / 1000ULL);
 	}
 
-	next.workload_level = dw_workload_level_from_signals(next.cpu_busy_pct,
-							     next.net_rx_softirq_pct,
+	next.workload_level = dw_workload_level_from_signals(next.net_rx_softirq_pct,
 							     next.avg_runqueue_latency_us);
 	next.deferred_budget = dw_budget_for_level(next.workload_level);
 	next.last_update_ns = now;
 
-	collector->prev_busy_time_ns = collector->total_busy_time_ns;
-	collector->prev_idle_time_ns = collector->total_idle_time_ns;
 	collector->prev_net_rx_softirq_time_ns = collector->total_net_rx_softirq_time_ns;
 	collector->prev_runqueue_latency_ns = collector->total_runqueue_latency_ns;
 	collector->prev_runqueue_latency_samples = collector->total_runqueue_latency_samples;
@@ -195,8 +155,6 @@ int workload_collector(struct trace_event_raw_sched_switch *ctx)
 		return 0;
 
 	now = bpf_ktime_get_ns();
-	dw_account_cpu_time(cpu_state, collector, now);
-	cpu_state->is_busy = ctx->next_pid != 0;
 
 	prev_pid = (__u32)ctx->prev_pid;
 	next_pid = (__u32)ctx->next_pid;
