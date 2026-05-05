@@ -148,7 +148,7 @@ void DFA_free(DFA_struct * dfa){
 	FREE_MM(dfa->hot_state);
 	FREE_MM(dfa);
 }
-int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices){
+int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices,DFA_node * last_state){
 
     DFA_node *node = root;
     int len = strlen((char *)byte);
@@ -179,6 +179,7 @@ int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices){
 	    temp = temp->failure;
         }
     }
+    last_state = node;
     return numMatches;
 }
 

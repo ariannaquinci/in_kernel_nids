@@ -121,6 +121,26 @@ static struct flow_ent *flow_ht[FLOW_BUCKETS];
 
 static struct workqueue_struct *dw_wq;
 
+
+/* -------- deferred analyses -------- */
+typedef struct result_chunk{
+	DFA_node *node;
+	u32 count;
+}result_chunk;
+typedef struct analysis_metadata{
+    result_chunk *vect_res_stage; //per ogni stage si fa l'analisi. e il risultato viene salvato qua!
+	u32 size_chunk; //dimensione di ogni stage!
+	u32 turn_end_stage; //permette di finire il turno di stage
+	u32 num_worker;
+	u32 pkt_id;
+}analysis_metadata;
+
+struct analysis_work {
+	struct work_struct work;
+	u32 id;
+	analysis_metadata * am;
+};
+
 /* -------- stats/debug -------- */
 
 static atomic_t st_pending   = ATOMIC_INIT(0);
@@ -154,7 +174,7 @@ static bool dw_bytes_contains(const u8 *buf, size_t len,
 	return false;
 }
 
-static bool dw_ac_match_bytes(DFA_node *root, const u8 *buf, size_t len)
+static bool dw_ac_match_bytes(DFA_node *root, const u8 *buf, size_t len, DFA_node *final_stage)
 {
 	unsigned char *tmp;
 	int *match_indices = NULL;
@@ -163,19 +183,23 @@ static bool dw_ac_match_bytes(DFA_node *root, const u8 *buf, size_t len)
 	if (!root || !buf || !len)
 		return false;
 
-	tmp = kmalloc(len + 1, GFP_KERNEL);
+	tmp = kmalloc(len + 1, GFP_KERNEL); //possiamo passare anche un vettore di stack!
 	if (!tmp)
 		return false;
 
-	memcpy(tmp, buf, len);
+	memcpy(tmp, buf, len); //perche un buffer temporaneo ?
 	tmp[len] = '\0';
 
-	matches = DFA_exec(root, tmp, &match_indices);
+	matches = DFA_exec(root, tmp, &match_indices,final_stage);
+	
 	kfree(match_indices);
 	kfree(tmp);
 
 	return matches > 0;
 }
+
+
+
 
 /* -------- helpers -------- */
 
@@ -400,7 +424,7 @@ retry:
 	rcu_read_unlock();
 }
 
-static bool frame_udp_payload_contains(const u8 *frame, u32 frame_len, const char *needle)
+static bool frame_udp_payload_contains(struct analysis_work* aw,const u8 *frame, u32 frame_len, const char *needle)
 {
 	const struct ethhdr *eth;
 	const struct iphdr *iph;
@@ -458,21 +482,69 @@ static bool frame_udp_payload_contains(const u8 *frame, u32 frame_len, const cha
 	if (!payload_len)
 		return false;
 
+	/*
 	if (!strcmp(needle, DW_DUMMY_NEEDLE))
 		return dw_bytes_contains(frame + payload_off, payload_len,
 					 (const u8 *)DW_DUMMY_NEEDLE,
 					 DW_DUMMY_NEEDLE_LEN);
-
+	*/
+	
 	if (payload_len < DW_AC_MIN_LEN)
 		return false;
 
 	if (strcmp(needle, DW_AC_PATTERN_LABEL))
 		return false;
+			
+		
+	DFA_node * last_node;
+	int count=0;
+	int my_rank = aw->id;
+	int actual_stage = 0;
+	analysis_metadata * am = aw->am;
+	size_t size_chunk = am->size_chunk;
+	int total_stage = payload_len/(size_chunk*2);
+	int num_worker = am->num_worker-1;
+	if(my_rank){
+			while(actual_stage<total_stage){
+				//size_chunk? termina da solo oppure devo stare attento?
+				count += dw_ac_match_bytes(dw_ac_root->hot_state[my_rank-1], frame + payload_off + (1+actual_stage*2*size_chunk),size_chunk,last_node);
+				while(am->vect_res_stage[my_rank-1].node) continue; //server piu memoria
+				am->vect_res_stage[my_rank-1].node = last_node;
+				am->vect_res_stage[my_rank-1].count = count;
+				__sync_fetch_and_add(&(am->turn_end_stage),1);
+				actual_stage++;
+				count = 0;
+			}
+	}else{
+			DFA_node *node= dw_ac_root->root;
+			while(actual_stage<total_stage){
+				count += dw_ac_match_bytes(node, frame + payload_off+(actual_stage *2*size_chunk) , size_chunk,last_node);
+				node = NULL;
+				while(am->turn_end_stage!=num_worker) continue; //aspetto hce le esecuzioni speculative terminino
+				am->turn_end_stage = 0; //deve essere atomica?
+				for(int i=0;i<num_worker;i++){
+					if(dw_ac_root->hot_state[i] == last_node){
+						node = am->vect_res_stage[i].node;//qui devo prendere anche il suo valore!
+						count += am->vect_res_stage[i].count;
+					}
+					am->vect_res_stage[i].node = NULL;				
+				}
+				if(!node){
+					//devo fare l'esecuzione normale!
+					count += dw_ac_match_bytes(last_node, frame + payload_off+(1+actual_stage*2*size_chunk) , size_chunk,last_node);
+					node = last_node;
+				}
+				actual_stage++;
+			}
+			size_t rest  =  payload_len%(size_chunk*2);
+			count += dw_ac_match_bytes(node, frame + payload_off+(actual_stage*2*size_chunk), rest,last_node);
+	}
 
-	return dw_ac_match_bytes(dw_ac_root->root, frame + payload_off, payload_len);
+	return count > 0;
+
 }
 
-static int snapshot_pkt_payload_contains(u32 pkt_id, const char *needle, bool *found_out)
+static int snapshot_pkt_payload_contains(struct analysis_work* aw, const char *needle, bool *found_out)
 {
 	struct pkt_snap_ent *e;
 	bool found;
@@ -481,13 +553,13 @@ static int snapshot_pkt_payload_contains(u32 pkt_id, const char *needle, bool *f
 		return -EINVAL;
 
 	rcu_read_lock();
-	e = snap_lookup_rcu(pkt_id);
+	e = snap_lookup_rcu(aw->am->pkt_id);
 	if (!e) {
 		rcu_read_unlock();
 		return -ENOENT;
 	}
 
-	found = frame_udp_payload_contains(e->data, e->cap_len, needle);
+	found = frame_udp_payload_contains(aw,e->data, e->cap_len, needle);
 	rcu_read_unlock();
 
 	*found_out = found;
@@ -792,13 +864,7 @@ bool dw_meta_get_and_del(struct dw_pkt_key *key, u32 *pkt_id_out, u32 *req_mask_
 }
 EXPORT_SYMBOL_GPL(dw_meta_get_and_del);
 
-/* -------- deferred analyses -------- */
 
-struct analysis_work {
-	struct work_struct work;
-	u32 pkt_id;
-	u32 bit;
-};
 
 static int flow_try_reserve_slot(struct flow_ent *fe, u32 *pos_out)
 {
@@ -940,7 +1006,7 @@ static void dw_try_deliver_ready(void)
 		}
 		atomic_set(&delivery_running, 0);
 	}
-}
+}analysis_metadata
 
 static void analysis_workfn(struct work_struct *w)
 {
@@ -951,31 +1017,11 @@ static void analysis_workfn(struct work_struct *w)
 	bool terminal = false;
 	int sig_rc;
 
-	/* Signature check reads the XDP snapshot copied at schedule time. */
-	
-	/* 3 analisi dummy: no false positive da pkt_id beyond the payload marker check above */
-	switch (aw->bit) {
-	case DW_REQ_A1:
-		is_malicious = false;
-		break;
-	case DW_REQ_A2:
-		sig_rc = snapshot_pkt_payload_contains(aw->pkt_id, DW_DUMMY_NEEDLE,
-						       &is_malicious);
-		if (sig_rc < 0)
-			pr_info("analysis pkt_id=%u bit=0x%x snapshot not available rc=%d, continuing\n",
-				aw->pkt_id, aw->bit, sig_rc);
-		break;
-	case DW_REQ_A3:
-		sig_rc = snapshot_pkt_payload_contains(aw->pkt_id, DW_AC_PATTERN_LABEL,
-						       &is_malicious);
-		if (sig_rc < 0)
-			pr_info("analysis pkt_id=%u bit=0x%x snapshot not available rc=%d, continuing\n",
-				aw->pkt_id, aw->bit, sig_rc);
-		break;
-	default:
-		break;
-	}
 
+	sig_rc = snapshot_pkt_payload_contains(aw, DW_AC_PATTERN_LABEL,&is_malicious);
+	if (sig_rc < 0)
+		pr_info("analysis pkt_id=%u bit=0x%x snapshot not available rc=%d, continuing\n",aw->am->pkt_id, aw->id, sig_rc);
+	/*
 	rcu_read_lock();
 	st = state_lookup_rcu(aw->pkt_id);
 	if (st) {
@@ -1006,8 +1052,13 @@ static void analysis_workfn(struct work_struct *w)
 	}
 	if (terminal)
 		dw_try_deliver_ready();
-
+	*/
+	if(aw->id == 0){
+		kfree(aw->am->vect_res_stage);
+		kfree(aw->am);
+	}
 	kfree(aw);
+	return;
 }
 
 /* -------- kfunc called by XDP: schedule analyses -------- */
@@ -1040,24 +1091,32 @@ static __bpf_kfunc int dw_register_and_schedule(u32 pkt_id, u32 req_mask)
 	}
 
 	ncpus = num_online_cpus();
-
-	for (id = 1; id <= 3; id++) {
-		u32 bit = 1u << (id - 1);
-		struct analysis_work *aw;
-
-		if (!(req_mask & bit))
-			continue;
-
-		aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
+	int num_worker = ncpus;
+	
+	analysis_metadata * am = (analysis_metadata *)kmalloc(sizeof(analysis_metadata), GFP_ATOMIC);
+	if (!am) {
+		atomic_inc(&st_dropped);
+		return -ENOENT;
+	}
+	am->num_worker=num_worker;
+	am->size_chunk=500;
+	am->turn_end_stage=0;
+	am->pkt_id = pkt_id;
+	am->vect_res_stage = kmalloc(sizeof(result_chunk)*num_worker, GFP_ATOMIC);
+	if (!am->vect_res_stage) {
+		atomic_inc(&st_dropped);
+		return -ENOENT;
+	}
+	for (id = 0; id < num_worker; id++) {
+		struct analysis_work *aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
 		if (!aw) {
 			atomic_inc(&st_dropped);
 			continue;
 		}
+		aw->id=id;
+		aw->am = am;
 		INIT_WORK(&aw->work, analysis_workfn);
-		aw->pkt_id = pkt_id;
-		aw->bit = bit;
-
-		cpu = atomic_inc_return(&rr_cpu) % ncpus;
+		cpu = atomic_inc_return(&rr_cpu) % ncpus; //?
 		queue_work_on(cpu, dw_wq, &aw->work);
 	}
 

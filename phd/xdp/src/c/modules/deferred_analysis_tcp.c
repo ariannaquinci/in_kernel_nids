@@ -324,8 +324,7 @@ static void dw_tcp_flow_init_once(struct dw_tcp_flow_state *state, struct tcp_so
 
 		WRITE_ONCE(state->approved_seq, copied_seq);
 		WRITE_ONCE(state->approved_pos, 0);
-		WRITE_ONCE(state->reserve_state,
-			   dw_tcp_pack_reserve_state(0, copied_seq));
+		WRITE_ONCE(state->reserve_state,dw_tcp_pack_reserve_state(0, copied_seq));
 		WRITE_ONCE(state->tail_seq, copied_seq);
 		WRITE_ONCE(state->tail_len, 0);
 	}
