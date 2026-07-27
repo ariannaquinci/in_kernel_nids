@@ -12,6 +12,7 @@
 #include <linux/atomic.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
+#include <linux/ktime.h>
 
 #include <net/tcp.h>
 
@@ -30,15 +31,13 @@ MODULE_DESCRIPTION("TCP deferred analysis backend for post-reordering stream chu
 #define DW_TCP_ANALYSIS_BITS 10
 #define DW_TCP_FLOW_BUCKETS (1U << DW_TCP_ANALYSIS_BITS)
 #define DW_TCP_CHUNK_MAX 4096u
-#define DW_TCP_DUMMY_NEEDLE "malicious"
-#define DW_TCP_DUMMY_NEEDLE_LEN (sizeof(DW_TCP_DUMMY_NEEDLE) - 1)
-#define DW_TCP_TAIL_LEN ((DW_AC_MAX_LEN > 1) ? (DW_AC_MAX_LEN - 1) : 1)
 #define DW_TCP_RING_SIZE 256U
 #define DW_TCP_RING_MASK (DW_TCP_RING_SIZE - 1)
 #define DW_TCP_MAX_INFLIGHT_BYTES (DW_TCP_RING_SIZE * DW_TCP_CHUNK_MAX)
 #define DW_TCP_REQ_A1 BIT(0)
 #define DW_TCP_REQ_A2 BIT(1)
 #define DW_TCP_REQ_MASK_2 (DW_TCP_REQ_A1 | DW_TCP_REQ_A2)
+#define DW_TCP_CHUNK_MAX_SEGS 32U
 
 struct dw_tcp_chunk_state;
 
@@ -56,16 +55,18 @@ struct dw_tcp_flow_state {
 	u32 approved_seq;
 	u32 approved_pos;
 	u64 reserve_state;
-	u32 tail_seq;
 	bool drop_armed;
-	u8 tail_len;
-	u8 tail[DW_TCP_TAIL_LEN];
 	atomic_t init_done;
-	atomic_t tail_busy;
 	atomic_t drain_running;
 	unsigned long last_seen_jiffies;
 	struct dw_tcp_ring_ent ring[DW_TCP_RING_SIZE];
 	struct dw_tcp_flow_state *next;
+};
+
+struct dw_tcp_seg_ref {
+	struct sk_buff *skb;
+	const u8 *data;
+	u32 len;
 };
 
 struct dw_tcp_chunk_state {
@@ -82,55 +83,82 @@ struct dw_tcp_chunk_state {
 	atomic_t pending;
 	bool ready;
 	u32 len;
-	u8 data[];
+	u32 nr_segs;
+	struct dw_tcp_seg_ref segs[DW_TCP_CHUNK_MAX_SEGS];
 };
 
 struct dw_tcp_analysis_work {
 	struct work_struct work;
 	struct dw_tcp_chunk_state *chunk;
 	u32 bit;
+	u64 scheduled_ns;
 };
 
 struct dw_tcp_flow_state *dw_tcp_flow_ht[DW_TCP_FLOW_BUCKETS];
 static struct workqueue_struct *dw_tcp_wq;
 static DFA_struct *dw_tcp_ac_root;
+static atomic64_t st_schedule_delay_total_ns = ATOMIC64_INIT(0);
+static atomic64_t st_schedule_delay_max_ns = ATOMIC64_INIT(0);
+static atomic64_t st_schedule_delay_count = ATOMIC64_INIT(0);
 
-static bool dw_tcp_buf_contains_dummy(const u8 *buf, size_t len)
+static void dw_tcp_chunk_free(struct dw_tcp_chunk_state *chunk);
+
+static void dw_tcp_note_schedule_delay(u64 scheduled_ns)
 {
-	size_t i;
+	u64 now;
+	u64 delta;
+	u64 old;
 
-	if (!buf || len < DW_TCP_DUMMY_NEEDLE_LEN)
-		return false;
+	if (!scheduled_ns)
+		return;
 
-	for (i = 0; i <= len - DW_TCP_DUMMY_NEEDLE_LEN; i++) {
-		if (!memcmp(buf + i, DW_TCP_DUMMY_NEEDLE, DW_TCP_DUMMY_NEEDLE_LEN))
-			return true;
+	now = ktime_get_ns();
+	if (now <= scheduled_ns)
+		return;
+
+	delta = now - scheduled_ns;
+	atomic64_inc(&st_schedule_delay_count);
+	atomic64_add(delta, &st_schedule_delay_total_ns);
+
+	old = (u64)atomic64_read(&st_schedule_delay_max_ns);
+	while (delta > old) {
+		u64 prev = (u64)atomic64_cmpxchg(&st_schedule_delay_max_ns,
+						      (s64)old, (s64)delta);
+
+		if (prev == old)
+			break;
+		old = prev;
 	}
-
-	return false;
 }
 
-static bool dw_tcp_buf_contains_ac(const u8 *buf, size_t len)
+static bool dw_tcp_chunk_contains_ac(const struct dw_tcp_chunk_state *chunk)
 {
-	unsigned char *tmp;
-	int *match_indices = NULL;
-	int matches;
+	DFA_node *state;
+	u32 seg;
+	u32 count = 0;
 
-	if (!dw_tcp_ac_root || !buf || len < DW_AC_MIN_LEN)
+	if (!dw_tcp_ac_root || !chunk || chunk->len < DW_AC_MIN_LEN)
 		return false;
 
-	tmp = kmalloc(len + 1, GFP_KERNEL);
-	if (!tmp)
-		return false;
+	state = dw_tcp_ac_root->root;
+	for (seg = 0; seg < chunk->nr_segs; seg++) {
+		int *match_indices = NULL;
+		int matches;
 
-	memcpy(tmp, buf, len);
-	tmp[len] = '\0';
+		if (!chunk->segs[seg].data || !chunk->segs[seg].len)
+			continue;
 
-	matches = DFA_exec(dw_tcp_ac_root->root, tmp, &match_indices);
-	kfree(match_indices);
-	kfree(tmp);
+		matches = DFA_exec_chunk(state, chunk->segs[seg].data,
+					 chunk->segs[seg].len, &match_indices,
+					 &state);
+		kfree(match_indices);
+		if (matches > 0)
+			count += matches;
+		if (!state)
+			state = dw_tcp_ac_root->root;
+	}
 
-	return matches > 0;
+	return count > 0;
 }
 
 static u32 dw_tcp_flow_bucket(u32 hash)
@@ -166,7 +194,7 @@ static void dw_tcp_flow_free(struct dw_tcp_flow_state *state)
 		if (!chunk)
 			continue;
 		WRITE_ONCE(state->ring[i].chunk, NULL);
-		kfree(chunk);
+		dw_tcp_chunk_free(chunk);
 	}
 
 	if (state->sk)
@@ -213,7 +241,6 @@ static struct dw_tcp_flow_state *dw_tcp_flow_get(struct sock *sk, u64 sock_cooki
 		state->sk = sk;
 		refcount_set(&state->refs, 2);
 		atomic_set(&state->init_done, 0);
-		atomic_set(&state->tail_busy, 0);
 		atomic_set(&state->drain_running, 0);
 		state->last_seen_jiffies = jiffies;
 		sock_hold(sk);
@@ -228,41 +255,90 @@ static struct dw_tcp_flow_state *dw_tcp_flow_get(struct sock *sk, u64 sock_cooki
 	}
 }
 
-static int dw_tcp_copy_stream_chunk(struct sock *sk, u32 from_seq, u32 to_seq, u8 *dst)
+static void dw_tcp_chunk_free(struct dw_tcp_chunk_state *chunk)
+{
+	u32 i;
+
+	if (!chunk)
+		return;
+	for (i = 0; i < chunk->nr_segs; i++) {
+		if (chunk->segs[i].skb)
+			kfree_skb(chunk->segs[i].skb);
+	}
+	kfree(chunk);
+}
+
+static void dw_tcp_chunk_put_refs(struct dw_tcp_chunk_state *chunk)
+{
+	u32 i;
+
+	if (!chunk)
+		return;
+	for (i = 0; i < chunk->nr_segs; i++) {
+		if (chunk->segs[i].skb)
+			kfree_skb(chunk->segs[i].skb);
+	}
+	memset(chunk->segs, 0, sizeof(chunk->segs));
+	chunk->nr_segs = 0;
+	chunk->len = 0;
+}
+
+static int dw_tcp_collect_linear_refs(struct sock *sk, u32 from_seq,
+				      u32 available_end,
+				      struct dw_tcp_chunk_state *chunk,
+				      u32 *to_seq_out)
 {
 	struct sk_buff *skb;
-	u32 out_off = 0;
+	u32 cur = from_seq;
 
 	skb_queue_walk(&sk->sk_receive_queue, skb) {
 		u32 skb_seq = TCP_SKB_CB(skb)->seq;
 		u32 skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-		u32 copy_from;
-		u32 copy_to;
-		u32 copy_len;
-		int rc;
+		u32 seg_to;
+		u32 off;
+		u32 len;
 
-		if (!before(skb_seq, to_seq))
+		if (chunk->len >= DW_TCP_CHUNK_MAX)
+			break;
+		if (!before(cur, available_end))
+			break;
+		if (!before(skb_seq, available_end))
 			break;
 
-		if (!before(from_seq, skb_end_seq))
+		if (!before(cur, skb_end_seq))
 			continue;
 
-		copy_from = before(from_seq, skb_seq) ? skb_seq : from_seq;
-		copy_to = before(skb_end_seq, to_seq) ? skb_end_seq : to_seq;
-		if (!before(copy_from, copy_to))
+		if (before(cur, skb_seq))
+			return -EAGAIN;
+
+		seg_to = before(skb_end_seq, available_end) ? skb_end_seq : available_end;
+		if (!before(cur, seg_to))
 			continue;
 
-		copy_len = copy_to - copy_from;
-		rc = skb_copy_bits(skb, copy_from - skb_seq, dst + out_off, copy_len);
-		if (rc < 0)
-			return rc;
-
-		out_off += copy_len;
-		if (out_off >= to_seq - from_seq)
+		off = cur - skb_seq;
+		len = min_t(u32, seg_to - cur, DW_TCP_CHUNK_MAX - chunk->len);
+		if (!len)
 			break;
+
+		if (off > skb_headlen(skb) || len > skb_headlen(skb) - off)
+			return -EMSGSIZE;
+		if (chunk->nr_segs >= DW_TCP_CHUNK_MAX_SEGS)
+			return -E2BIG;
+
+		skb_get(skb);
+		chunk->segs[chunk->nr_segs].skb = skb;
+		chunk->segs[chunk->nr_segs].data = skb->data + off;
+		chunk->segs[chunk->nr_segs].len = len;
+		chunk->nr_segs++;
+		chunk->len += len;
+		cur += len;
 	}
 
-	return (int)out_off;
+	if (!chunk->len)
+		return -ENODATA;
+
+	*to_seq_out = cur;
+	return 0;
 }
 
 static unsigned int dw_tcp_hash_to_cpu(u64 sock_cookie)
@@ -324,13 +400,42 @@ static void dw_tcp_flow_init_once(struct dw_tcp_flow_state *state, struct tcp_so
 
 		WRITE_ONCE(state->approved_seq, copied_seq);
 		WRITE_ONCE(state->approved_pos, 0);
-		WRITE_ONCE(state->reserve_state,dw_tcp_pack_reserve_state(0, copied_seq));
-		WRITE_ONCE(state->tail_seq, copied_seq);
-		WRITE_ONCE(state->tail_len, 0);
+		WRITE_ONCE(state->reserve_state,
+			   dw_tcp_pack_reserve_state(0, copied_seq));
 	}
 }
 
-static int dw_tcp_reserve_chunk(struct dw_tcp_flow_state *state, u32 available_end,
+static void dw_tcp_fail_open_to(struct dw_tcp_flow_state *state, u32 seq)
+{
+	u64 cur_state;
+	u32 cur_pos;
+	u32 cur_seq;
+	u32 approved;
+
+	for (;;) {
+		cur_state = READ_ONCE(state->reserve_state);
+		cur_pos = dw_tcp_reserve_pos(cur_state);
+		cur_seq = dw_tcp_reserve_seq(cur_state);
+		if (!before(cur_seq, seq))
+			break;
+		if (cmpxchg64(&state->reserve_state, cur_state,
+			      dw_tcp_pack_reserve_state(cur_pos, seq)) == cur_state)
+			break;
+		cpu_relax();
+	}
+
+	for (;;) {
+		approved = READ_ONCE(state->approved_seq);
+		if (!before(approved, seq))
+			break;
+		if (cmpxchg(&state->approved_seq, approved, seq) == approved)
+			break;
+		cpu_relax();
+	}
+}
+
+static int dw_tcp_reserve_chunk(struct dw_tcp_flow_state *state, struct sock *sk,
+				u32 available_end, struct dw_tcp_chunk_state *chunk,
 				u32 *pos, u32 *from_seq, u32 *to_seq)
 {
 	for (;;) {
@@ -338,9 +443,9 @@ static int dw_tcp_reserve_chunk(struct dw_tcp_flow_state *state, u32 available_e
 		u32 head_pos = READ_ONCE(state->approved_pos);
 		u32 cur_pos = dw_tcp_reserve_pos(cur_state);
 		u32 cur_from = dw_tcp_reserve_seq(cur_state);
-		u32 chunk_len;
 		u32 cur_to;
 		u64 next_state;
+		int rc;
 
 		if (!before(cur_from, available_end))
 			return 0;
@@ -348,8 +453,15 @@ static int dw_tcp_reserve_chunk(struct dw_tcp_flow_state *state, u32 available_e
 		if (cur_pos - head_pos >= DW_TCP_RING_SIZE)
 			return -EAGAIN;
 
-		chunk_len = min_t(u32, available_end - cur_from, DW_TCP_CHUNK_MAX);
-		cur_to = cur_from + chunk_len;
+		chunk->nr_segs = 0;
+		chunk->len = 0;
+		rc = dw_tcp_collect_linear_refs(sk, cur_from, available_end,
+						chunk, &cur_to);
+		if (rc < 0) {
+			dw_tcp_chunk_put_refs(chunk);
+			return rc;
+		}
+
 		next_state = dw_tcp_pack_reserve_state(cur_pos + 1, cur_to);
 		if (cmpxchg64(&state->reserve_state, cur_state, next_state) == cur_state) {
 
@@ -358,67 +470,9 @@ static int dw_tcp_reserve_chunk(struct dw_tcp_flow_state *state, u32 available_e
 			*to_seq = cur_to;
 			return 1;
 		}
+		dw_tcp_chunk_put_refs(chunk);
 		cpu_relax();
 	}
-}
-
-static u8 dw_tcp_tail_snapshot(struct dw_tcp_flow_state *state, u32 from_seq, u8 *prefix)
-{
-	int retries;
-
-	for (retries = 0; retries < 1024; retries++) {
-		u32 tail_seq;
-		u8 tail_len;
-
-		if (atomic_read(&state->tail_busy)) {
-			cpu_relax();
-			continue;
-		}
-
-		tail_seq = READ_ONCE(state->tail_seq);
-		if (tail_seq != from_seq) {
-			cpu_relax();
-			continue;
-		}
-
-		tail_len = READ_ONCE(state->tail_len);
-		if (tail_len)
-			memcpy(prefix, state->tail, tail_len);
-
-		smp_rmb();
-		if (!atomic_read(&state->tail_busy) &&
-		    READ_ONCE(state->tail_seq) == from_seq &&
-		    READ_ONCE(state->tail_len) == tail_len)
-			return tail_len;
-	}
-
-	return 0;
-}
-
-static void dw_tcp_publish_tail(struct dw_tcp_flow_state *state, u32 to_seq,
-				const u8 *buf, u32 len)
-{
-	u32 cur_tail;
-	u8 next_tail_len;
-
-	cur_tail = READ_ONCE(state->tail_seq);
-	if (!before(cur_tail, to_seq))
-		return;
-
-	if (atomic_cmpxchg(&state->tail_busy, 0, 1) != 0)
-		return;
-
-	cur_tail = READ_ONCE(state->tail_seq);
-	if (before(cur_tail, to_seq)) {
-		next_tail_len = min_t(u8, len, DW_TCP_TAIL_LEN);
-		WRITE_ONCE(state->tail_len, next_tail_len);
-		if (next_tail_len)
-			memcpy(state->tail, buf + len - next_tail_len, next_tail_len);
-		smp_wmb();
-		WRITE_ONCE(state->tail_seq, to_seq);
-	}
-
-	atomic_set(&state->tail_busy, 0);
 }
 
 static void dw_tcp_try_drain_flow(struct dw_tcp_flow_state *state)
@@ -458,7 +512,7 @@ static void dw_tcp_try_drain_flow(struct dw_tcp_flow_state *state)
 		WRITE_ONCE(ent->ready, false);
 		WRITE_ONCE(ent->chunk, NULL);
 		dw_tcp_flow_put(state);
-		kfree(chunk);
+		dw_tcp_chunk_free(chunk);
 
 		if (dropped)
 			break;
@@ -488,7 +542,7 @@ static void dw_tcp_mark_chunk_ready(struct dw_tcp_chunk_state *chunk)
 static void dw_tcp_finalize_chunk(struct dw_tcp_chunk_state *chunk)
 {
 	if (!chunk || !chunk->state) {
-		kfree(chunk);
+		dw_tcp_chunk_free(chunk);
 		return;
 	}
 
@@ -508,19 +562,16 @@ static void dw_tcp_finalize_chunk(struct dw_tcp_chunk_state *chunk)
 	dw_tcp_mark_chunk_ready(chunk);
 }
 
-static void dw_tcp_analysis_workfn(struct work_struct *work)
+static void dw_tcp_analysis_complete(struct dw_tcp_chunk_state *chunk, u32 bit)
 {
-	struct dw_tcp_analysis_work *aw = container_of(work, struct dw_tcp_analysis_work, work);
-	struct dw_tcp_chunk_state *chunk = aw->chunk;
 	bool hit;
 
-	switch (aw->bit) {
+	switch (bit) {
 	case DW_TCP_REQ_A1:
-		
-		hit = dw_tcp_buf_contains_dummy(chunk->data, chunk->len);
+		hit = false;
 		break;
 	case DW_TCP_REQ_A2:
-		hit = dw_tcp_buf_contains_ac(chunk->data, chunk->len);
+		hit = dw_tcp_chunk_contains_ac(chunk);
 		break;
 	default:
 		hit = false;
@@ -528,14 +579,27 @@ static void dw_tcp_analysis_workfn(struct work_struct *work)
 	}
 
 	if (hit)
-		atomic_or(aw->bit, &chunk->hit_mask);
+		atomic_or(bit, &chunk->hit_mask);
 
-	atomic_or(aw->bit, &chunk->done_mask);
+	atomic_or(bit, &chunk->done_mask);
 
 	if (atomic_dec_and_test(&chunk->pending))
 		dw_tcp_finalize_chunk(chunk);
+}
+
+static void dw_tcp_analysis_work_complete(struct dw_tcp_analysis_work *aw)
+{
+	dw_tcp_analysis_complete(aw->chunk, aw->bit);
 
 	kfree(aw);
+}
+
+static void dw_tcp_analysis_workfn(struct work_struct *work)
+{
+	struct dw_tcp_analysis_work *aw = container_of(work, struct dw_tcp_analysis_work, work);
+
+	dw_tcp_note_schedule_delay(aw->scheduled_ns);
+	dw_tcp_analysis_work_complete(aw);
 }
 
 int dw_tcp_enqueue_stream(struct sock *sk)
@@ -547,7 +611,6 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	struct dw_tcp_chunk_state *chunk;
 	u64 sock_cookie;
 	u64 reserve_state;
-	u64 expect_state;
 	u32 hash;
 	u32 pos;
 	u32 from_seq;
@@ -555,12 +618,9 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	u32 available_end;
 	u32 req_mask;
 	unsigned int cpu;
-	u8 prefix_len;
-	u8 prefix[DW_TCP_TAIL_LEN];
 	u32 analysis_bits[2] = { DW_TCP_REQ_A1, DW_TCP_REQ_A2 };
 	unsigned int scheduled = 0;
 	int i;
-	int copied;
 	int reserve_rc;
 	bool hit;
 
@@ -583,57 +643,40 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	}
 
 	available_end = READ_ONCE(tp->rcv_nxt);
-	reserve_rc = dw_tcp_reserve_chunk(state, available_end, &pos, &from_seq, &to_seq);
+	chunk = kzalloc(sizeof(*chunk), GFP_ATOMIC);
+	if (!chunk) {
+		dw_tcp_flow_put(state);
+		return -ENOMEM;
+	}
+
+	reserve_rc = dw_tcp_reserve_chunk(state, sk, available_end, chunk,
+					  &pos, &from_seq, &to_seq);
 	if (reserve_rc <= 0) {
+		if (reserve_rc < 0) {
+			pr_info_ratelimited("tcp zero-copy unavailable cookie=%#llx rc=%d rcv_nxt=%u -> fail open\n",
+					    sock_cookie, reserve_rc,
+					    available_end);
+			dw_tcp_fail_open_to(state, available_end);
+		}
+		dw_tcp_chunk_free(chunk);
 		dw_tcp_flow_put(state);
 		return (reserve_rc == 0) ? 0 : reserve_rc;
 	}
 
 	WRITE_ONCE(state->last_seen_jiffies, jiffies);
 
-	prefix_len = dw_tcp_tail_snapshot(state, from_seq, prefix);
-	chunk = kzalloc(struct_size(chunk, data, DW_TCP_TAIL_LEN + DW_TCP_CHUNK_MAX),
-			GFP_ATOMIC);
-	if (!chunk) {
-		expect_state = dw_tcp_pack_reserve_state(pos + 1, to_seq);
-		if (cmpxchg64(&state->reserve_state, expect_state,
-			      dw_tcp_pack_reserve_state(pos, from_seq)) != expect_state)
-			pr_info("tcp rollback failed cookie=%#llx chunk=%u..%u\n",
-				sock_cookie, from_seq, to_seq);
-		dw_tcp_flow_put(state);
-		return -ENOMEM;
-	}
-
 	chunk->sock_cookie = sock_cookie;
 	chunk->state = state;
 	chunk->pos = pos;
 	chunk->from_seq = from_seq;
 	chunk->to_seq = to_seq;
-	chunk->scan_from_seq = from_seq - prefix_len;
+	chunk->scan_from_seq = from_seq;
 	chunk->scan_to_seq = to_seq;
-
-	if (prefix_len)
-		memcpy(chunk->data, prefix, prefix_len);
-
-	copied = dw_tcp_copy_stream_chunk(sk, from_seq, to_seq, chunk->data + prefix_len);
-	if (copied <= 0) {
-		expect_state = dw_tcp_pack_reserve_state(pos + 1, to_seq);
-		if (cmpxchg64(&state->reserve_state, expect_state,
-			      dw_tcp_pack_reserve_state(pos, from_seq)) != expect_state)
-			pr_info("tcp rollback failed cookie=%#llx chunk=%u..%u rc=%d\n",
-				sock_cookie, from_seq, to_seq, copied);
-		dw_tcp_flow_put(state);
-		kfree(chunk);
-		return copied ? copied : -ENODATA;
-	}
-
-	chunk->len = prefix_len + copied;
 	req_mask = dw_tcp_chunk_req_mask(chunk->len);
 	chunk->req_mask = req_mask;
 	atomic_set(&chunk->done_mask, 0);
 	atomic_set(&chunk->hit_mask, 0);
 	WRITE_ONCE(state->last_seen_jiffies, jiffies);
-	dw_tcp_publish_tail(state, to_seq, chunk->data, chunk->len);
 
 	ent = &state->ring[dw_tcp_ring_idx(pos)];
 	if (READ_ONCE(ent->chunk)) {
@@ -644,7 +687,7 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 			dw_tcp_reserve_pos(reserve_state),
 			dw_tcp_reserve_seq(reserve_state));
 		dw_tcp_flow_put(state);
-		kfree(chunk);
+		dw_tcp_chunk_free(chunk);
 		return -EAGAIN;
 	}
 	WRITE_ONCE(ent->pos, pos);
@@ -662,10 +705,10 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 		if (!aw[i]) {
 			switch (analysis_bits[i]) {
 			case DW_TCP_REQ_A1:
-				hit = dw_tcp_buf_contains_dummy(chunk->data, chunk->len);
+				hit = false;
 				break;
 			case DW_TCP_REQ_A2:
-				hit = dw_tcp_buf_contains_ac(chunk->data, chunk->len);
+				hit = dw_tcp_chunk_contains_ac(chunk);
 				break;
 			default:
 				hit = false;
@@ -689,6 +732,7 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	for (i = 0; i < ARRAY_SIZE(analysis_bits); i++) {
 		if (!aw[i])
 			continue;
+		aw[i]->scheduled_ns = ktime_get_ns();
 		queue_work_on(cpu, dw_tcp_wq, &aw[i]->work);
 	}
 
@@ -698,7 +742,7 @@ int dw_tcp_enqueue_stream(struct sock *sk)
 	pr_debug("tcp enqueue cookie=%#llx copied_seq=%u rcv_nxt=%u chunk=%u..%u len=%u cpu=%u analyses=0x%x\n",
 		 sock_cookie, READ_ONCE(tp->copied_seq), available_end,
 		 chunk->from_seq, chunk->to_seq, chunk->len, cpu, req_mask);
-	return copied;
+	return chunk->len;
 }
 EXPORT_SYMBOL_GPL(dw_tcp_enqueue_stream);
 
@@ -764,6 +808,38 @@ out:
 	return allowed;
 }
 
+static int get_st_schedule_delay_total_ns(char *buf, const struct kernel_param *kp)
+{
+	return sprintf(buf, "%lld\n",
+		       (long long)atomic64_read(&st_schedule_delay_total_ns));
+}
+
+static int get_st_schedule_delay_max_ns(char *buf, const struct kernel_param *kp)
+{
+	return sprintf(buf, "%lld\n",
+		       (long long)atomic64_read(&st_schedule_delay_max_ns));
+}
+
+static int get_st_schedule_delay_count(char *buf, const struct kernel_param *kp)
+{
+	return sprintf(buf, "%lld\n",
+		       (long long)atomic64_read(&st_schedule_delay_count));
+}
+
+static const struct kernel_param_ops st_schedule_delay_total_ns_ops = { .get = get_st_schedule_delay_total_ns };
+static const struct kernel_param_ops st_schedule_delay_max_ns_ops = { .get = get_st_schedule_delay_max_ns };
+static const struct kernel_param_ops st_schedule_delay_count_ops = { .get = get_st_schedule_delay_count };
+
+module_param_cb(st_schedule_delay_total_ns, &st_schedule_delay_total_ns_ops, NULL, 0440);
+MODULE_PARM_DESC(st_schedule_delay_total_ns,
+		 "Total ns between deferred work scheduling and execution start");
+module_param_cb(st_schedule_delay_max_ns, &st_schedule_delay_max_ns_ops, NULL, 0440);
+MODULE_PARM_DESC(st_schedule_delay_max_ns,
+		 "Max ns between deferred work scheduling and execution start");
+module_param_cb(st_schedule_delay_count, &st_schedule_delay_count_ops, NULL, 0440);
+MODULE_PARM_DESC(st_schedule_delay_count,
+		 "Deferred work items measured for schedule-to-execute delay");
+
 static int hot_state_array[20];
 static int hot_state_size = 0;
 
@@ -773,6 +849,9 @@ EXPORT_SYMBOL_GPL(dw_tcp_approved_len);
 static int __init deferred_analysis_tcp_init(void)
 {
 	memset(dw_tcp_flow_ht, 0, sizeof(dw_tcp_flow_ht));
+	atomic64_set(&st_schedule_delay_total_ns, 0);
+	atomic64_set(&st_schedule_delay_max_ns, 0);
+	atomic64_set(&st_schedule_delay_count, 0);
 	dw_tcp_wq = alloc_workqueue("dw_tcp_wq", WQ_HIGHPRI | WQ_UNBOUND, 0);
 	if (!dw_tcp_wq)
 		return -ENOMEM;

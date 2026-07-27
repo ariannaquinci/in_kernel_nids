@@ -2,6 +2,7 @@
 #define __DW_PRINT_H__
 
 #include <linux/printk.h>
+#include <linux/ratelimit.h>
 
 /*
  * Higher PRINT_LEVEL values suppress more logs.
@@ -23,8 +24,21 @@
 			printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__);         \
 	} while (0)
 
+#define DW_PRINT_RATELIMITED(level, fmt, ...)                                 \
+	do {                                                                  \
+		static DEFINE_RATELIMIT_STATE(_rs,                         \
+			DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST); \
+		if ((level) >= PRINT_LEVEL && PRINT_LEVEL < DW_PRINT_SILENT && \
+		    __ratelimit(&_rs))                                      \
+			printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__);         \
+	} while (0)
+
 #undef pr_debug
 #define pr_debug(fmt, ...) DW_PRINT(DW_PRINT_VERBOSE, fmt, ##__VA_ARGS__)
+
+#undef pr_debug_ratelimited
+#define pr_debug_ratelimited(fmt, ...)                                        \
+	DW_PRINT_RATELIMITED(DW_PRINT_VERBOSE, fmt, ##__VA_ARGS__)
 
 #undef pr_info
 #define pr_info(fmt, ...) DW_PRINT(DW_PRINT_INFO, fmt, ##__VA_ARGS__)

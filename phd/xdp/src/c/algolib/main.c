@@ -1,115 +1,172 @@
-#include "algo-ac.h"
+#include <pcap.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define MAX_LINE_LENGTH 1024
-#define MAX_PATTERNS 1000
 
-// Funzione che legge file e popola patterns array
-int load_patterns(const char *filename, char **patterns, int max_patterns) {
-    FILE *file = fopen(filename, "r");
-    if (!file) {
-        perror("Errore apertura file");
+#include "algo-ac.h"
+
+#define MAX_PATTERNS 4096
+#define MAX_LINE_LEN 1024
+
+static void free_patterns(void **patterns, int *sizes, int count) {
+    for (int i = 0; i < count; i++) {
+        free(patterns[i]);
+    }
+
+    free(patterns);
+    free(sizes);
+}
+
+static int load_patterns(const char *filename, void ***patterns_out,
+                         int **sizes_out) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        perror("fopen");
         return -1;
     }
 
-    char line[MAX_LINE_LENGTH];
+    void **patterns = malloc(sizeof(void *) * MAX_PATTERNS);
+    int *sizes = malloc(sizeof(int) * MAX_PATTERNS);
+
+    if (!patterns || !sizes) {
+        perror("malloc");
+        fclose(fp);
+        return -1;
+    }
+
+    char line[MAX_LINE_LEN];
     int count = 0;
 
-    while (fgets(line, sizeof(line), file) && count < max_patterns) {
-        // Rimuove newline alla fine della riga
+    while (fgets(line, sizeof(line), fp)) {
+
         size_t len = strlen(line);
-        if (len > 0 && (line[len - 1] == '\n' || line[len -1] == '\r')) {
-            line[len - 1] = '\0';
-            len--;
-            if (len > 0 && line[len -1] == '\r') line[len -1] = '\0'; // per Windows CRLF
+
+        /* remove newline */
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
         }
 
-        // Salva copia della linea nel dizionario
-        patterns[count] = strdup(line);
-        if (!patterns[count]) {
+        if (len == 0)
+            continue;
+
+        unsigned char *p = malloc(len + 1);
+
+        if (!p) {
             perror("malloc");
-            fclose(file);
+            fclose(fp);
+            free_patterns(patterns, sizes, count);
             return -1;
         }
 
+        memcpy(p, line, len);
+        p[len] = '\0';
+
+        patterns[count] = p;
+        sizes[count] = (int)len;
+
         count++;
+
+        if (count >= MAX_PATTERNS) {
+            fprintf(stderr, "Troppi pattern\n");
+            break;
+        }
     }
 
-    fclose(file);
+    fclose(fp);
+
+    *patterns_out = patterns;
+    *sizes_out = sizes;
+
     return count;
 }
 
-int main(int argc,char**argv)
-{
-
-    if (argc < 2) {
-        printf("Uso: %s <file_patterns>\n", argv[0]);
-        return 1;
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <trace.pcap> <patterns.txt>\n", argv[0]);
+        return EXIT_FAILURE;
     }
-    char **patterns;
-    patterns = (char**) malloc(sizeof(char*)*MAX_PATTERNS);
-    int num_patterns = load_patterns(argv[1], patterns, MAX_PATTERNS);
-    if (num_patterns < 0) {
-        fprintf(stderr, "Errore nel caricamento dei pattern\n");
-        return 1;
-    }    
 
-    DFA_node *root = DFA_build(patterns, num_patterns);
+    const char *pcap_file = argv[1];
+    const char *pattern_file = argv[2];
 
-    unsigned char *text = (unsigned char *)"\
-	    Questa è la riga 1: testo normale senza pattern.\
-Riga 2: LoginAttempt rilevato nel flusso.\
-Riga 3: testo normale.\
-Riga 4: BadUserAgent trovato qui.\
-Riga 5: ancora testo normale.\
-Riga 6: SQLInjection è presente in questa riga.\
-Riga 7: testo normale.\
-Riga 8: CrossSiteScript compare di nuovo.\
-Riga 9: MalwareDownload rilevato.\
-Riga 10: testo normale.\
-Riga 11: PhishingLink appare qui.\
-Riga 12: RansomwareDetect è visibile.\
-Riga 13: ExploitKit e ShellcodePattern entrambi presenti.\
-Riga 14: TrojanSignature qui.\
-Riga 15: testo normale.\
-Riga 16: LoginAttempt di nuovo.\
-Riga 17: BadUserAgent ripetuto.\
-Riga 18: SQLInjection ripresentato.\
-Riga 19: CrossSiteScript.\
-Riga 20: MalwareDownload.\
-Riga 21: testo normale.\
-Riga 22: PhishingLink.\
-Riga 23: RansomwareDetect.\
-Riga 24: ExploitKit.\
-Riga 25: ShellcodePattern.\
-Riga 26: TrojanSignature.\
-Riga 27: LoginAttempt.\
-Riga 28: BadUserAgent.\
-Riga 29: SQLInjection.\
-Riga 30: CrossSiteScript.\
-Riga 196: PhishingLink.\
-Riga 197: RansomwareDetect.\
-Riga 198: ExploitKit.\
-Riga 199: ShellcodePattern.\
-Riga 200: TrojanSignature. Fine del test.";
-        
-    printf("text %s\n",text);
-    printf("strlen(text)=%ld\n",strlen(text));
-    int *matchIndices; // = (int *)malloc(num_patterns * sizeof(int));
-    printf("match\n");
-    int numMatches = DFA_exec(root, text,&matchIndices);
-    printf("matches: %d\n",numMatches);
-    for (int i = 0; i < numMatches; i++)
-    {
-	if(matchIndices[i]!=-1){
-		printf("sto qua %d\n",matchIndices[i]);
-        	printf("%s\n", patterns[matchIndices[i]]);
-    	}
+    void **patterns = NULL;
+    int *pattern_sizes = NULL;
+
+    int pattern_count = load_patterns(pattern_file, &patterns, &pattern_sizes);
+
+    if (pattern_count <= 0) {
+        fprintf(stderr, "Errore caricamento pattern\n");
+        return EXIT_FAILURE;
     }
-    printf("numero di matching: %d\n",numMatches);
-    DFA_debug(root);
-    DFA_free(root);
-    return 0;
+
+    printf("[+] Loaded %d patterns\n", pattern_count);
+
+    /*
+     *      * Build DFA
+     *           */
+    DFA_struct *dfa =
+        DFA_build((const void **)patterns, pattern_count, pattern_sizes, 0);
+
+    if (!dfa) {
+        fprintf(stderr, "Errore DFA_build\n");
+        free_patterns(patterns, pattern_sizes, pattern_count);
+        return EXIT_FAILURE;
+    }
+
+    /*
+     *      * Open pcap
+     *           */
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    pcap_t *handle = pcap_open_offline(pcap_file, errbuf);
+
+    if (!handle) {
+        fprintf(stderr, "pcap_open_offline(): %s\n", errbuf);
+
+        DFA_free(dfa);
+        free_patterns(patterns, pattern_sizes, pattern_count);
+
+        return EXIT_FAILURE;
+    }
+
+    struct pcap_pkthdr *header;
+    const u_char *packet;
+
+    int ret;
+    int pkt_count = 0;
+
+    /*
+     *      * Scan packets
+     *           */
+    while ((ret = pcap_next_ex(handle, &header, &packet)) >= 0) {
+        if (ret == 0)
+            continue;
+
+        pkt_count++;
+
+        int *matches = NULL;
+
+        DFA_exec_chunk(dfa->root, packet, (int)header->caplen, &matches, NULL);
+
+        if (matches)
+            free(matches);
+    }
+
+    printf("[+] Processed packets: %d\n", pkt_count);
+
+    /*
+     *      * Print DFA statistics / hot states
+     *           */
+    DFA_debug(dfa->root);
+
+    /*
+     *      * Cleanup
+     *           */
+    pcap_close(handle);
+
+    DFA_free(dfa);
+
+    free_patterns(patterns, pattern_sizes, pattern_count);
+
+    return EXIT_SUCCESS;
 }
-

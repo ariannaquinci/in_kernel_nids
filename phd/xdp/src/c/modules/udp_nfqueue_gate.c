@@ -209,7 +209,7 @@ static int __init gate_init(void)
         return ret;
     }
 
-    pr_info("udp_nfqueue_gate loaded (lockless ring, Q=%u)\n", Q_SIZE);
+    pr_debug("udp_nfqueue_gate loaded (lockless ring, Q=%u)\n", Q_SIZE);
     return 0;
 }
 
@@ -232,7 +232,7 @@ static void __exit gate_exit(void)
             kfree_skb(skb);
     }
 
-    pr_info("udp_nfqueue_gate unloaded\n");
+    pr_debug("udp_nfqueue_gate unloaded\n");
 }
 
 module_init(gate_init);

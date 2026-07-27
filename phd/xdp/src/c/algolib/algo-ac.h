@@ -17,7 +17,8 @@ typedef struct DFA_struct{
 	int hot_state_size;
 }DFA_struct;
 
-int DFA_exec(DFA_node*, const unsigned char*,int **,DFA_node *);
+int DFA_exec(DFA_node*, const unsigned char*,int **);
+int DFA_exec_chunk(DFA_node*, const unsigned char*, int, int **, DFA_node **);
 void DFA_debug(DFA_node*);
 DFA_struct * DFA_build(const void **,int,int *,int); //la size è opzionale maybe
 void DFA_free(DFA_struct *);

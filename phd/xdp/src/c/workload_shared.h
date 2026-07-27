@@ -102,23 +102,4 @@ static __always_inline __u32 dw_sanitize_budget(__u32 budget)
 	return budget;
 }
 
-static __always_inline __u32 dw_apply_deferred_budget(__u32 req_mask, __u32 budget)
-{
-	__u32 capped = 0;
-	__u32 remaining = dw_sanitize_budget(budget);
-
-	if ((req_mask & DW_REQ_A1) && remaining) {
-		capped |= DW_REQ_A1;
-		remaining--;
-	}
-	if ((req_mask & DW_REQ_A2) && remaining) {
-		capped |= DW_REQ_A2;
-		remaining--;
-	}
-	if ((req_mask & DW_REQ_A3) && remaining)
-		capped |= DW_REQ_A3;
-
-	return capped;
-}
-
 #endif

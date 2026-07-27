@@ -16,13 +16,6 @@ struct dw_pkt_key {
 	__u16 pad2;
 } __attribute__((packed));
 
-enum {
-	DW_REQ_A1    = 1u << 0,
-	DW_REQ_A2    = 1u << 1,
-	DW_REQ_A3    = 1u << 2,
-	DW_REQ_MASK_3 = DW_REQ_A1 | DW_REQ_A2 | DW_REQ_A3,
-};
-
 #define DW_XDP_SNAPSHOT_MAX 4096u
 
 enum {

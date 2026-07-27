@@ -6,10 +6,11 @@
 #ifndef STAMPA
 #define STAMPA(...) pr_debug(__VA_ARGS__)
 #endif
-#define REQUEST_MM(x) kmalloc(x,GFP_KERNEL)
-#define REALLOC_MM(x,y) krealloc(x,y,GFP_KERNEL)
+#define REQUEST_MM(x) kmalloc(x, GFP_ATOMIC)
+#define REALLOC_MM(x,y) krealloc(x, y, GFP_ATOMIC)
 #define FREE_MM(x) kfree(x)
 #define SORT_MM(base, num, size, cmp) sort((base), (num), (size), (cmp), NULL)
+#define DFA_COUNT_VISIT(node) do { } while (0)
 #else
 #include <string.h>
 #include <unistd.h>
@@ -20,6 +21,7 @@
 #define REALLOC_MM(x,y) realloc(x,y)
 #define FREE_MM(x) free(x)
 #define SORT_MM(base, num, size, cmp) qsort((base), (num), (size), (cmp))
+#define DFA_COUNT_VISIT(node) __sync_fetch_and_add(&((node)->visit_c), 1)
 #endif
 volatile int state_id=0;
 static DFA_node *create_dfa_node(void){
@@ -148,25 +150,32 @@ void DFA_free(DFA_struct * dfa){
 	FREE_MM(dfa->hot_state);
 	FREE_MM(dfa);
 }
-int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices,DFA_node * last_state){
-
+int DFA_exec_chunk(DFA_node* root, const unsigned char *byte, int len,
+		   int **matchIndices, DFA_node **last_state)
+{
     DFA_node *node = root;
-    int len = strlen((char *)byte);
     int matchIndicesCapacity = 100; // Initial capacity
     int numMatches = 0;
+
+    if (last_state)
+        *last_state = root;
+    if (!root || !byte || len < 0 || !matchIndices)
+        return 0;
+
     *matchIndices = (int *) REQUEST_MM(matchIndicesCapacity * sizeof(int));
-    if(*matchIndices == NULL) return 0;
+    if (*matchIndices == NULL) return 0;
+
     for (int i = 0; i < len; i++)
     {
 	while (node && !node->link[byte[i]])
-      	{
-            node = node->failure;
-        }
-        
+	{
+	    node = node->failure;
+	}
+
 	node = node ? node->link[byte[i]] : root;
-        
-	// **Incremento qui**
-	if (node) __sync_fetch_and_add(&(node->visit_c),1);
+
+	if (node)
+	    DFA_COUNT_VISIT(node);
 	DFA_node *temp = node;
         while (temp && temp->end_of_word)
         {
@@ -174,13 +183,24 @@ int DFA_exec(DFA_node* root, const unsigned char*byte,int **matchIndices,DFA_nod
             {
                 matchIndicesCapacity *= 2;
                 *matchIndices = (int *) REALLOC_MM(*matchIndices, matchIndicesCapacity * sizeof(int));
+                if (*matchIndices == NULL) return numMatches;
             }
             (*matchIndices)[numMatches++] = temp->index;
 	    temp = temp->failure;
         }
     }
-    last_state = node;
+
+    if (last_state)
+        *last_state = node ? node : root;
     return numMatches;
+}
+
+int DFA_exec(DFA_node* root, const unsigned char *byte, int **matchIndices)
+{
+    if (!byte)
+        return 0;
+
+    return DFA_exec_chunk(root, byte, strlen((char *)byte), matchIndices, NULL);
 }
 
 static void collect_states(DFA_node *node, DFA_node **array, int *count, int max_count) {

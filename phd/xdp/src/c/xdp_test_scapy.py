@@ -9,7 +9,7 @@ DEFAULT_DPORT = 9999
 DEFAULT_SPORT = 5555
 DEFAULT_COUNT = 5
 DEFAULT_INTERVAL = 0.2
-DEFAULT_PAYLOAD = b"hello DW_DUMMY_NEEDLE test"
+DEFAULT_PAYLOAD = b"hello benign test"
 
 
 def build_packet(args):
@@ -42,7 +42,7 @@ def parse_args():
         "--payload",
         default=DEFAULT_PAYLOAD,
         type=lambda x: x.encode() if isinstance(x, str) else x,
-        help="Payload ASCII (default contiene DW_DUMMY_NEEDLE)",
+        help="Payload ASCII",
     )
     parser.add_argument("--show", action="store_true", help="Mostra packet summary e bytes")
     return parser.parse_args()

@@ -1,5 +1,6 @@
 obj-m += deferred_analysis_udp.o
 obj-m += netfilter_hook_udp.o
+obj-m += netif_receive_udp_hook.o
 obj-m += deferred_analysis_tcp.o
 obj-m += tcp_stream_hook.o
 
@@ -8,6 +9,13 @@ PWD  := $(shell pwd)
 TEARDOWN := $(abspath $(PWD)/../detach_xdp_unload_modules.sh)
 PATTERN_FILE := $(abspath $(PWD)/../algolib/patterns.txt)
 PATTERN_HEADER := $(abspath $(PWD)/dw_ac_patterns_autogen.h)
+UDP_HOT_STATE_PARAM := $(if $(HOT_STATES),hot_state_array=$(HOT_STATES),)
+UDP_INLINE_ANALYSIS_PARAM := $(if $(INLINE_ANALYSIS),inline_analysis=$(INLINE_ANALYSIS),)
+UDP_SINGLE_WORKER_PARAM := $(if $(SINGLE_WORKER),single_worker=$(SINGLE_WORKER),)
+UDP_DEFERRED_WORKER_COUNT_PARAM := $(if $(DEFERRED_WORKER_COUNT),deferred_worker_count=$(DEFERRED_WORKER_COUNT),)
+PRINT_LEVEL ?= 2
+
+ccflags-y += -DPRINT_LEVEL=$(PRINT_LEVEL)
 
 all: prepare_patterns
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -41,6 +49,11 @@ netfilter_hook_udp: prepare_patterns
 	$(MAKE) -C $(KDIR) M=$(PWD) deferred_analysis_udp.ko
 	$(MAKE) -C $(KDIR) M=$(PWD) KBUILD_EXTRA_SYMBOLS=$(PWD)/Module.symvers netfilter_hook_udp.ko
 
+# Build the skb-side UDP receive producer after generating Module.symvers
+netif_receive_udp_hook: prepare_patterns
+	$(MAKE) -C $(KDIR) M=$(PWD) deferred_analysis_udp.ko
+	$(MAKE) -C $(KDIR) M=$(PWD) KBUILD_EXTRA_SYMBOLS=$(PWD)/Module.symvers netif_receive_udp_hook.ko
+
 # Build the TCP deferred backend stub
 deferred_analysis_tcp: prepare_patterns
 	$(MAKE) -C $(KDIR) M=$(PWD) deferred_analysis_tcp.ko
@@ -64,6 +77,15 @@ load_tcp:
 	insmod deferred_analysis_tcp.ko
 	insmod tcp_stream_hook.ko
 
+load_udp:
+	insmod deferred_analysis_udp.ko $(UDP_HOT_STATE_PARAM) $(UDP_INLINE_ANALYSIS_PARAM) $(UDP_SINGLE_WORKER_PARAM) $(UDP_DEFERRED_WORKER_COUNT_PARAM)
+	insmod netfilter_hook_udp.ko
+
+load_udp_skb:
+	insmod deferred_analysis_udp.ko $(UDP_HOT_STATE_PARAM) $(UDP_INLINE_ANALYSIS_PARAM) $(UDP_SINGLE_WORKER_PARAM) $(UDP_DEFERRED_WORKER_COUNT_PARAM)
+	insmod netif_receive_udp_hook.ko
+	insmod netfilter_hook_udp.ko
+
 load_all:
 	insmod deferred_analysis_udp.ko
 	insmod netfilter_hook_udp.ko
@@ -77,8 +99,7 @@ unload:
 		echo "missing teardown script: $(TEARDOWN)" >&2; \
 		exit 1; \
 	fi
-	rmmod tcp_stream_hook
-	rmmod deferred_analysis_tcp
 	rmmod netfilter_hook_udp
+	rmmod netif_receive_udp_hook
 	rmmod deferred_analysis_udp
 	

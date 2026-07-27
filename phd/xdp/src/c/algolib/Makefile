@@ -15,11 +15,11 @@ all: $(TARGET)
 
 # Link finale
 $(TARGET): $(OBJ)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJ)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJ) -lpcap
 
 # Compilazione dei singoli file
 main.o: main.c algo-ac.h
-	$(CC) $(CFLAGS) -c main.c
+	$(CC) $(CFLAGS) -c main.c -lpcap
 
 libac.o: algo-ac.c algo-ac.h
 	$(CC) $(CFLAGS) -c algo-ac.c -o libac.o

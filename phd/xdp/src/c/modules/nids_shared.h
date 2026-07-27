@@ -5,7 +5,7 @@
 #include <linux/types.h>
 
 struct nids_status {
-    __u32 analyses_done;   // 0..3
+    __u32 analyses_done;  
     __u32 is_malicious;    // 0/1
 };
 

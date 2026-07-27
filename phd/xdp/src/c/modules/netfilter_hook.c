@@ -29,7 +29,6 @@ static bool dw_net_hook_registered;
 struct dw_nfq_cb {
 	u32 magic;
 	u32 pkt_id;
-	u32 req_mask;
 } __aligned(4);
 
 static inline struct dw_nfq_cb *dw_nfqcb(struct sk_buff *skb)
@@ -42,7 +41,6 @@ static int dw_nfqueue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 {
 	struct sk_buff *skb;
 	struct dw_nfq_cb meta;
-	u32 done = 0;
 	int rc;
 
 	if (!entry || !entry->skb) {
@@ -60,25 +58,25 @@ static int dw_nfqueue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 
 	memset(skb->cb, 0, sizeof(skb->cb));
 
-	rc = dw_buffer_nfqueue_entry(entry, meta.pkt_id, meta.req_mask);
+	rc = dw_buffer_nfqueue_entry(entry, meta.pkt_id);
 	if (rc < 0) {
-		pr_err("nfqueue buffer failed pkt_id=%u req=0x%x rc=%d\n",
-		       meta.pkt_id, meta.req_mask, rc);
+		pr_err("nfqueue buffer failed pkt_id=%u rc=%d\n",
+		       meta.pkt_id, rc);
 		nf_reinject(entry, NF_DROP);
 		return 0;
 	}
 	if (rc == DW_NFQ_DROPPED) {
-		pr_info("nfqueue immediate drop pkt_id=%u req=0x%x: verdict already DROP\n",
-			meta.pkt_id, meta.req_mask);
+		pr_info("nfqueue immediate drop pkt_id=%u: verdict already DROP\n",
+			meta.pkt_id);
 		return 0;
 	}
 
-	if (!dw_are_done(meta.pkt_id, meta.req_mask, &done))
-		pr_info("nfqueue buffered pkt_id=%u req=0x%x done=0x%x: analyses not finished yet\n",
-			meta.pkt_id, meta.req_mask, done);
+	if (!dw_analysis_done(meta.pkt_id))
+		pr_info("nfqueue buffered pkt_id=%u: analysis not finished yet\n",
+			meta.pkt_id);
 	else
-		pr_info("nfqueue buffered pkt_id=%u req=0x%x done=0x%x: queued for ordered delivery\n",
-			meta.pkt_id, meta.req_mask, done);
+		pr_info("nfqueue buffered pkt_id=%u: queued for ordered delivery\n",
+			meta.pkt_id);
 
 	return 0;
 }
@@ -130,7 +128,7 @@ static unsigned int dw_nf_local_in(void *priv,
 {
 	struct dw_pkt_key key;
 	const struct net_device *in_dev = state ? state->in : NULL;
-	u32 pkt_id, req_mask;
+	u32 pkt_id;
 	int verdict;
 
 	if (!skb)
@@ -141,7 +139,7 @@ static unsigned int dw_nf_local_in(void *priv,
 		return NF_ACCEPT;
 
 	/* consuma correlazione prodotta in XDP */
-	if (!dw_meta_get_and_del(&key, &pkt_id, &req_mask)) {
+	if (!dw_meta_get_and_del(&key, &pkt_id)) {
 		pr_info("corr miss if=%s ifindex=%d key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u\n",
 			in_dev ? in_dev->name : "?",
 			in_dev ? in_dev->ifindex : -1,
@@ -151,15 +149,15 @@ static unsigned int dw_nf_local_in(void *priv,
 		return NF_ACCEPT;
 	}
 
-	pr_info("corr hit pkt_id=%u req=0x%x key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u\n",
-		pkt_id, req_mask,
+	pr_info("corr hit pkt_id=%u key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u\n",
+		pkt_id,
 		ntohl(key.saddr), ntohl(key.daddr),
 		ntohs(key.sport), ntohs(key.dport),
 		ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 
 	if (dw_nfqueue_is_stopping()) {
-		pr_info("nf teardown stopping pkt_id=%u req=0x%x -> accept without queue\n",
-			pkt_id, req_mask);
+		pr_info("nf teardown stopping pkt_id=%u -> accept without queue\n",
+			pkt_id);
 		return NF_ACCEPT;
 	}
 
@@ -177,15 +175,15 @@ static unsigned int dw_nf_local_in(void *priv,
 	 * Preserve per-flow order: all correlated non-DROP packets are buffered.
 	 * Delivery worker drains each flow FIFO only from the flow head.
 	 */
-	if (dw_are_done(pkt_id, req_mask, NULL))
-		pr_info("nf analyses done pkt_id=%u req=0x%x key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u verdict=PASS -> queue (ordered delivery)\n",
-			pkt_id, req_mask,
+	if (dw_analysis_done(pkt_id))
+		pr_info("nf analysis done pkt_id=%u key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u verdict=PASS -> queue (ordered delivery)\n",
+			pkt_id,
 			ntohl(key.saddr), ntohl(key.daddr),
 			ntohs(key.sport), ntohs(key.dport),
 			ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
 	else
-		pr_info("nf analyses pending pkt_id=%u req=0x%x key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u -> queue\n",
-			pkt_id, req_mask,
+		pr_info("nf analysis pending pkt_id=%u key s=%08x d=%08x sp=%u dp=%u id=%u len=%u proto=%u -> queue\n",
+			pkt_id,
 			ntohl(key.saddr), ntohl(key.daddr),
 			ntohs(key.sport), ntohs(key.dport),
 			ntohs(key.ip_id), ntohs(key.udp_len), key.proto);
@@ -193,7 +191,6 @@ static unsigned int dw_nf_local_in(void *priv,
 	memset(skb->cb, 0, sizeof(skb->cb));
 	dw_nfqcb(skb)->magic = DW_NFQ_CB_MAGIC;
 	dw_nfqcb(skb)->pkt_id = pkt_id;
-	dw_nfqcb(skb)->req_mask = req_mask & DW_REQ_MASK_3;
 
 	return NF_QUEUE_NR(dw_nf_queue_num);
 }
